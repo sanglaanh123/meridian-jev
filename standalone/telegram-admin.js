@@ -20,6 +20,7 @@ const ENV_PATH = repoPath(".env");
 export const ADMIN_COMMANDS = [
   { command: "menu", description: "Open the settings console" },
   { command: "status", description: "Bot status, scanner stats, positions" },
+  { command: "stats", description: "PnL and win rate from the database" },
   { command: "cancel", description: "Abort the current edit" },
 ];
 
@@ -252,7 +253,7 @@ function fmtValue(setting) {
 function rootKeyboard() {
   const mode = `🌑 Shadow: ${config.standalone.shadow ? "ON" : "OFF"}`;
   return [
-    [{ text: "🖥 Status", callback_data: "s:status" }],
+    [{ text: "🖥 Status", callback_data: "s:status" }, { text: "📊 Stats", callback_data: "s:stats" }],
     ...SECTIONS.map(s => [{ text: s.title, callback_data: `s:${s.id}` }]),
     [{ text: "🔑 Bot key", callback_data: "s:key" }, { text: mode, callback_data: "m:shadow" }],
     [{ text: "♻️ Restart bot", callback_data: "m:restart" }],
@@ -333,6 +334,9 @@ async function viewSection(sectionId, note = "") {
   if (sectionId === "status") {
     return void await render(await statusText(), [[{ text: "🔄 Refresh", callback_data: "s:status" }, { text: "← Back", callback_data: "s:root" }]]);
   }
+  if (sectionId === "stats") {
+    return void await render(await statsText(), [[{ text: "🔄 Refresh", callback_data: "s:stats" }, { text: "← Back", callback_data: "s:root" }]]);
+  }
   const section = SECTIONS.find(s => s.id === sectionId);
   if (!section) return void await viewRoot();
   const menu = sectionMenu(section);
@@ -359,6 +363,32 @@ async function statusText() {
     const positions = await getMyPositions({ force: true, silent: true });
     lines.push(`Positions: ${positions.total_positions}${positions.positions.length ? ` (${positions.positions.map(p => `${p.pair ?? "?"} ${p.pnl_pct ?? "?"}%`).join(", ")})` : ""}`);
   } catch { lines.push("Positions: unavailable"); }
+  return lines.join("\n");
+}
+
+// Closed-position results and tracked state, read from meridian.db.
+async function statsText() {
+  const { getPerformanceBreakdown } = await import("../performance.js");
+  const { getStateSummary } = await import("../state.js");
+  const { listBlacklist } = await import("../token-blacklist.js");
+  const usd = n => `${n >= 0 ? "+" : "-"}${Math.abs(n).toFixed(2)}`;
+  const pct = n => n == null ? "—" : `${n}%`;
+  const line = (title, r) => `${title}: ${r.count} closed · ${usd(r.total_pnl_usd)} · avg ${pct(r.avg_pnl_pct)} · win ${pct(r.win_rate_pct)}`;
+  const groups = rows => rows.length ? rows.map(r => `  ${line(escapeHtml(r.key), r)}`).join("\n") : "  —";
+  const day = getPerformanceBreakdown({ hours: 24 });
+  const week = getPerformanceBreakdown({ hours: 168 });
+  const state = getStateSummary();
+  const lines = [
+    `📊 <b>Stats</b>`,
+    `Tracked positions: ${state.open_positions} open · ${state.closed_positions} closed · fees claimed ${state.total_fees_claimed_usd}`,
+    line("24h", day),
+    line("7d", week),
+    `<b>7d by tier</b>\n${groups(week.by_tier)}`,
+    `<b>7d by label</b>\n${groups(week.by_label)}`,
+    `<b>7d by close reason</b>\n${groups(week.by_close_reason)}`,
+    `<b>Last closes</b>\n${week.recent.length ? week.recent.map(r => `  ${escapeHtml(r.pool_name ?? "?")} ${pct(r.pnl_pct)} (${escapeHtml(r.close_reason ?? "?")})`).join("\n") : "  —"}`,
+    `Blacklisted mints: ${listBlacklist().count}`,
+  ];
   return lines.join("\n");
 }
 
@@ -482,9 +512,10 @@ async function handleText(text) {
       consoleMessageId = null;
       lastRenderSig = null;
     }
-    return void await viewRoot("Commands: /menu · /status · /cancel");
+    return void await viewRoot("Commands: /menu · /status · /stats · /cancel");
   }
   if (cmd === "/status") return void await viewSection("status");
+  if (cmd === "/stats") return void await viewSection("stats");
 }
 
 // ─── Wiring ──────────────────────────────────────────────────────────────────
@@ -492,7 +523,7 @@ async function handleText(text) {
 const adminContext = { scanner: null, activeSignals: null };
 
 // Exposed for the menu-schema tests in test/cleanup.test.js.
-export const _test = { SECTIONS, byKey, editHint, validate, sectionMenu, fmtValue };
+export const _test = { SECTIONS, byKey, editHint, validate, sectionMenu, fmtValue, statsText };
 
 export function startAdmin({ scanner = null, activeSignals = null } = {}) {
   adminContext.scanner = scanner;

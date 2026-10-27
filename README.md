@@ -100,7 +100,7 @@ The default is `shadowMode: true`, which forces `DRY_RUN=true`.
 Set `dryRunSolBalance` (for example `1`) so a dry run sizes entries like a real 1 SOL wallet. The simulated balance is fixed; it is not reduced after each entry.
 
 To go live:
-1. Review the dry-run results in `node cli.js performance` / `lessons.json`.
+1. Review the dry-run results with `node cli.js db stats` or `node cli.js performance`.
 2. Set `shadowMode: false` and remove `DRY_RUN=true`.
 3. Restart.
 
@@ -219,7 +219,14 @@ node cli.js close --position ADDRESS [--reason TEXT] [--skip-swap] [--dry-run]
 node cli.js claim --position ADDRESS
 node cli.js swap --from MINT --to MINT --amount N
 node cli.js blacklist [add|remove] --mint ADDRESS
+node cli.js db stats [--hours N]      # PnL by tier, label and close reason (default 168h)
+node cli.js db positions [--open]     # tracked positions
+node cli.js db signals                # scanner signals + entry attempts
+node cli.js db decisions [--limit N]  # recent deploy/close decisions
+node cli.js db query "SELECT ..."     # read-only SQL against meridian.db
 ```
+
+The Telegram admin console has the same summary under 📊 Stats (or `/stats`).
 
 There is no manual deploy command; only the scanner opens positions. `--dry-run` simulates every transaction.
 
@@ -265,11 +272,11 @@ All of these files are git-ignored.
 |---|---|
 | `user-config.json` | Configuration |
 | `coin-labels.json` | Coin labels |
-| `wallet-monitor-state.json` | Signals, cooldowns, attempts (crash recovery) |
-| `state.json` | Tracked positions (tier, label, per-position stop/OOR) |
-| `lessons.json` | Closed-position history with tier, label, regime, indicators and Jev |
-| `pool-memory.json`, `token-blacklist.json`, `dev-blocklist.json` | Pool history, cooldowns, blocklists |
+| `meridian.db` | SQLite state (`db.js`): `signals`, `attempts` (crash recovery), `positions`, `position_events`, `performance`, `pools` (history, cooldowns), `token_blacklist`, `dev_blocklist`, `decisions`, `kv` |
+| `*.json.migrated` | Legacy JSON state files, kept after their one-time import into `meridian.db` |
 | `logs/` | Daily logs |
+
+`MERIDIAN_DB` overrides the database path. On first open, legacy JSON state files (`wallet-monitor-state.json`, `state.json`, `lessons.json`, `pool-memory.json`, `token-blacklist.json`, `dev-blocklist.json`, `decision-log.json`) next to the database are imported once and renamed to `.migrated`. Stop the daemon before upgrading so it does not write JSON after the import.
 
 A `submitting` attempt left by a crash needs on-chain reconciliation before that mint can be tried again. Do not delete state to bypass it.
 
@@ -286,7 +293,7 @@ Covers:
 - the CLI surface
 - the Telegram menu schema
 
-Tests never send transactions, never touch the network, and never write to `logs/`.
+Tests never send transactions, never touch the network, and never write to `logs/` or `meridian.db`.
 
 ## History
 

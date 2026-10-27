@@ -108,7 +108,8 @@ test('active dependencies and configuration contain no retired agent integration
 test('telegram admin menu schema is complete and every control renders', async () => {
   const {config} = await import('../config.js');
   const {_test} = await import('../standalone/telegram-admin.js');
-  const {SECTIONS, byKey, editHint, validate, sectionMenu, fmtValue} = _test;
+  const {SECTIONS, byKey, editHint, validate, sectionMenu, fmtValue, statsText} = _test;
+  assert.match(await statsText(), /Stats[\s\S]*24h: 0 closed[\s\S]*Blacklisted mints: 0/, 'stats view renders from an empty database');
   assert.deepEqual(SECTIONS.map(s => s.id), ['scanner', 'screening', 'bluechip', 'midcap', 'risk', 'strategy', 'exits', 'rpc']);
   assert.ok(SECTIONS.some(s => s.id === 'strategy' && s.settings.some(x => x.k === 'strategy')), 'strategy shape must be configurable');
 

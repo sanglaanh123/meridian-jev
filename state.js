@@ -1,5 +1,5 @@
 /**
- * Persistent agent state — stored in state.json.
+ * Persistent agent state — stored in the SQLite positions tables (db.js).
  *
  * Tracks position metadata that isn't available on-chain:
  * - When a position was deployed
@@ -8,14 +8,11 @@
  * - Actions taken (claims, rebalances)
  */
 
-import fs from "fs";
 import { log } from "./logger.js";
 import { config } from "./config.js";
-import { repoPath } from "./repo-root.js";
+import { getDb, getDoc, putDoc, listDocs, getKv, setKv, tx } from "./db.js";
 
-const STATE_FILE = repoPath("state.json");
-
-const MAX_RECENT_EVENTS = 20;
+const RECENT_EVENTS_SHOWN = 10;
 const MAX_INSTRUCTION_LENGTH = 280;
 
 function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
@@ -29,24 +26,16 @@ function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
   return cleaned || null;
 }
 
-function load() {
-  if (!fs.existsSync(STATE_FILE)) {
-    return { positions: {}, recentEvents: [], lastUpdated: null };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  } catch (err) {
-    log("state_error", `Failed to read state.json: ${err.message}`);
-    return { positions: {}, lastUpdated: null };
-  }
-}
+const getPos = (address) => getDoc("positions", address);
 
-function save(state) {
+function save(pos) {
   try {
-    state.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    tx(() => {
+      putDoc("positions", pos.position, pos);
+      setKv("state_last_updated", new Date().toISOString());
+    });
   } catch (err) {
-    log("state_error", `Failed to write state.json: ${err.message}`);
+    log("state_error", `Failed to write position ${pos.position}: ${err.message}`);
   }
 }
 
@@ -79,8 +68,7 @@ export function trackPosition({
   stop_loss_pct,
   oor_wait_minutes = null,
 }) {
-  const state = load();
-  state.positions[position] = {
+  const pos = {
     position,
     pool,
     pool_name,
@@ -122,8 +110,10 @@ export function trackPosition({
     pending_exit_started_at: null,
     trailing_active: false,
   };
-  pushEvent(state, { action: "deploy", position, pool_name: pool_name || pool });
-  save(state);
+  tx(() => {
+    save(pos);
+    pushEvent({ action: "deploy", position, pool_name: pool_name || pool });
+  });
   log("state", `Tracked new position: ${position} in pool ${pool}`);
 }
 
@@ -131,12 +121,11 @@ export function trackPosition({
  * Mark a position as out of range (sets timestamp on first detection).
  */
 export function markOutOfRange(position_address) {
-  const state = load();
-  const pos = state.positions[position_address];
+  const pos = getPos(position_address);
   if (!pos) return;
   if (!pos.out_of_range_since) {
     pos.out_of_range_since = new Date().toISOString();
-    save(state);
+    save(pos);
     log("state", `Position ${position_address} marked out of range`);
   }
 }
@@ -145,12 +134,11 @@ export function markOutOfRange(position_address) {
  * Mark a position as back in range (clears OOR timestamp).
  */
 export function markInRange(position_address) {
-  const state = load();
-  const pos = state.positions[position_address];
+  const pos = getPos(position_address);
   if (!pos) return;
   if (pos.out_of_range_since) {
     pos.out_of_range_since = null;
-    save(state);
+    save(pos);
     log("state", `Position ${position_address} back in range`);
   }
 }
@@ -160,8 +148,7 @@ export function markInRange(position_address) {
  * Returns 0 if currently in range.
  */
 export function minutesOutOfRange(position_address) {
-  const state = load();
-  const pos = state.positions[position_address];
+  const pos = getPos(position_address);
   if (!pos || !pos.out_of_range_since) return 0;
   const ms = Date.now() - new Date(pos.out_of_range_since).getTime();
   return Math.floor(ms / 60000);
@@ -171,38 +158,35 @@ export function minutesOutOfRange(position_address) {
  * Record a fee claim event.
  */
 export function recordClaim(position_address, fees_usd) {
-  const state = load();
-  const pos = state.positions[position_address];
+  const pos = getPos(position_address);
   if (!pos) return;
   pos.last_claim_at = new Date().toISOString();
   pos.total_fees_claimed_usd = (pos.total_fees_claimed_usd || 0) + (fees_usd || 0);
   pos.notes.push(`Claimed ~$${fees_usd?.toFixed(2) || "?"} fees at ${pos.last_claim_at}`);
-  save(state);
+  save(pos);
 }
 
 /**
  * Append to the recent events log (shown in every prompt).
  */
-function pushEvent(state, event) {
-  if (!state.recentEvents) state.recentEvents = [];
-  state.recentEvents.push({ ts: new Date().toISOString(), ...event });
-  if (state.recentEvents.length > MAX_RECENT_EVENTS) {
-    state.recentEvents = state.recentEvents.slice(-MAX_RECENT_EVENTS);
-  }
+function pushEvent(event) {
+  getDb().prepare("INSERT INTO position_events (ts, action, position, pool_name, reason) VALUES (?, ?, ?, ?, ?)")
+    .run(new Date().toISOString(), event.action, event.position ?? null, event.pool_name ?? null, event.reason ?? null);
 }
 
 /**
  * Mark a position as closed.
  */
 export function recordClose(position_address, reason) {
-  const state = load();
-  const pos = state.positions[position_address];
+  const pos = getPos(position_address);
   if (!pos) return;
   pos.closed = true;
   pos.closed_at = new Date().toISOString();
   pos.notes.push(`Closed at ${pos.closed_at}: ${reason}`);
-  pushEvent(state, { action: "close", position: position_address, pool_name: pos.pool_name || pos.pool, reason });
-  save(state);
+  tx(() => {
+    save(pos);
+    pushEvent({ action: "close", position: position_address, pool_name: pos.pool_name || pos.pool, reason });
+  });
   log("state", `Position ${position_address} marked closed: ${reason}`);
 }
 
@@ -211,11 +195,10 @@ export function recordClose(position_address, reason) {
  * Overwrites any previous instruction. Pass null to clear.
  */
 export function setPositionInstruction(position_address, instruction) {
-  const state = load();
-  const pos = state.positions[position_address];
+  const pos = getPos(position_address);
   if (!pos) return false;
   pos.instruction = sanitizeStoredText(instruction);
-  save(state);
+  save(pos);
   log("state", `Position ${position_address} instruction set: ${pos.instruction}`);
   return true;
 }
@@ -229,8 +212,7 @@ export function setPositionInstruction(position_address, instruction) {
  */
 export function confirmPeak(position_address, candidatePnlPct, confirmTicks = 2) {
   if (candidatePnlPct == null) return false;
-  const state = load();
-  const pos = state.positions[position_address];
+  const pos = getPos(position_address);
   if (!pos || pos.closed) return false;
 
   const currentPeak = pos.peak_pnl_pct ?? 0;
@@ -239,7 +221,7 @@ export function confirmPeak(position_address, candidatePnlPct, confirmTicks = 2)
     if (pos.pending_peak_pnl_pct != null) {
       pos.pending_peak_pnl_pct = null;
       pos.pending_peak_confirm_count = 0;
-      save(state);
+      save(pos);
     }
     return false;
   }
@@ -260,12 +242,12 @@ export function confirmPeak(position_address, candidatePnlPct, confirmTicks = 2)
     pos.pending_peak_pnl_pct = null;
     pos.pending_peak_confirm_count = 0;
     pos.pending_peak_started_at = null;
-    save(state);
+    save(pos);
     log("state", `Position ${position_address} peak PnL confirmed at ${pos.peak_pnl_pct.toFixed(2)}% (${confirmTicks} ticks)`);
     return true;
   }
 
-  save(state);
+  save(pos);
   return false;
 }
 
@@ -277,15 +259,14 @@ export function confirmPeak(position_address, candidatePnlPct, confirmTicks = 2)
  * Returns { fire, action, count }.
  */
 export function registerExitSignal(position_address, signal, confirmTicks = 2) {
-  const state = load();
-  const pos = state.positions[position_address];
+  const pos = getPos(position_address);
   if (!pos || pos.closed) return { fire: false, action: null, count: 0 };
 
   if (!signal) {
     if (pos.pending_exit_action != null) {
       pos.pending_exit_action = null;
       pos.pending_exit_count = 0;
-      save(state);
+      save(pos);
     }
     return { fire: false, action: null, count: 0 };
   }
@@ -305,7 +286,7 @@ export function registerExitSignal(position_address, signal, confirmTicks = 2) {
     pos.pending_exit_count = 0;
     pos.pending_exit_started_at = null;
   }
-  save(state);
+  save(pos);
   if (fire) log("state", `Position ${position_address} exit signal "${signal}" confirmed (${confirmTicks} ticks)`);
   return { fire, action: signal, count };
 }
@@ -314,28 +295,29 @@ export function registerExitSignal(position_address, signal, confirmTicks = 2) {
  * Get all tracked positions (optionally filter open-only).
  */
 export function getTrackedPositions(openOnly = false) {
-  const state = load();
-  const all = Object.values(state.positions);
-  return openOnly ? all.filter((p) => !p.closed) : all;
+  return listDocs("positions", openOnly ? "WHERE closed = 0" : "");
 }
 
 /**
  * Get a single tracked position.
  */
 export function getTrackedPosition(position_address) {
-  const state = load();
-  return state.positions[position_address] || null;
+  return getPos(position_address);
 }
 
 /**
  * Summarize state for the agent system prompt.
  */
 export function getStateSummary() {
-  const state = load();
-  const open = Object.values(state.positions).filter((p) => !p.closed);
-  const closed = Object.values(state.positions).filter((p) => p.closed);
-  const totalFeesClaimed = Object.values(state.positions)
-    .reduce((sum, p) => sum + (p.total_fees_claimed_usd || 0), 0);
+  const all = listDocs("positions");
+  const open = all.filter((p) => !p.closed);
+  const closed = all.filter((p) => p.closed);
+  const totalFeesClaimed = all.reduce((sum, p) => sum + (p.total_fees_claimed_usd || 0), 0);
+  const recentEvents = getDb()
+    .prepare("SELECT ts, action, position, pool_name, reason FROM position_events ORDER BY id DESC LIMIT ?")
+    .all(RECENT_EVENTS_SHOWN)
+    .reverse()
+    .map((e) => Object.fromEntries(Object.entries(e).filter(([, v]) => v != null)));
 
   return {
     open_positions: open.length,
@@ -353,8 +335,8 @@ export function getStateSummary() {
       rebalance_count: p.rebalance_count,
       instruction: p.instruction || null,
     })),
-    last_updated: state.lastUpdated,
-    recent_events: (state.recentEvents || []).slice(-10),
+    last_updated: getKv("state_last_updated"),
+    recent_events: recentEvents,
   };
 }
 
@@ -368,8 +350,7 @@ export function getStateSummary() {
  */
 export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
   const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h } = positionData;
-  const state = load();
-  const pos = state.positions[position_address];
+  const pos = getPos(position_address);
   if (!pos || pos.closed) return null;
 
   let changed = false;
@@ -392,7 +373,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     log("state", `Position ${position_address} back in range`);
   }
 
-  if (changed) save(state);
+  if (changed) save(pos);
 
   // ── Stop loss ──────────────────────────────────────────────────
   // The tier recorded at entry may tighten the stop; the global value is the fallback.
@@ -455,17 +436,14 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
  * Get the date (YYYY-MM-DD UTC) when the last briefing was sent.
  */
 export function getLastBriefingDate() {
-  const state = load();
-  return state._lastBriefingDate || null;
+  return getKv("last_briefing_date");
 }
 
 /**
  * Record that the briefing was sent today.
  */
 export function setLastBriefingDate() {
-  const state = load();
-  state._lastBriefingDate = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
-  save(state);
+  setKv("last_briefing_date", new Date().toISOString().slice(0, 10)); // YYYY-MM-DD UTC
 }
 
 /**
@@ -475,13 +453,12 @@ export function setLastBriefingDate() {
 const SYNC_GRACE_MS = 5 * 60_000; // don't auto-close positions deployed < 5 min ago
 
 export function syncOpenPositions(active_addresses) {
-  const state = load();
   const activeSet = new Set(active_addresses);
-  let changed = false;
+  const changed = [];
 
-  for (const posId in state.positions) {
-    const pos = state.positions[posId];
-    if (pos.closed || activeSet.has(posId)) continue;
+  for (const pos of getTrackedPositions(true)) {
+    const posId = pos.position;
+    if (activeSet.has(posId)) continue;
 
     // Grace period: newly deployed positions may not be indexed yet
     const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
@@ -493,9 +470,9 @@ export function syncOpenPositions(active_addresses) {
     pos.closed = true;
     pos.closed_at = new Date().toISOString();
     pos.notes.push(`Auto-closed during state sync (not found on-chain)`);
-    changed = true;
+    changed.push(pos);
     log("state", `Position ${posId} auto-closed (missing from on-chain data)`);
   }
 
-  if (changed) save(state);
+  if (changed.length) tx(() => changed.forEach(save));
 }

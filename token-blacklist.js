@@ -5,25 +5,11 @@
  * Focused screening rejects blacklisted tokens before entry.
  */
 
-import fs from "fs";
 import { log } from "./logger.js";
-import { repoPath } from "./repo-root.js";
+import { getDb } from "./db.js";
 
-const BLACKLIST_FILE = repoPath("token-blacklist.json");
-
-function load() {
-  if (!fs.existsSync(BLACKLIST_FILE)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(BLACKLIST_FILE, "utf8"));
-  } catch (error) {
-    log("blacklist_error", `Invalid ${BLACKLIST_FILE}: ${error.message}`);
-    throw new Error(`Safety blacklist is unreadable: ${BLACKLIST_FILE}`);
-  }
-}
-
-function save(data) {
-  fs.writeFileSync(BLACKLIST_FILE, JSON.stringify(data, null, 2));
-}
+// Read errors propagate: an unreadable blacklist must fail closed.
+const getEntry = (mint) => getDb().prepare("SELECT symbol, reason, added_at, added_by FROM token_blacklist WHERE mint = ?").get(mint);
 
 // ─── Check ─────────────────────────────────────────────────────
 
@@ -33,8 +19,7 @@ function save(data) {
  */
 export function isBlacklisted(mint) {
   if (!mint) return false;
-  const db = load();
-  return !!db[mint];
+  return !!getEntry(mint);
 }
 
 // ─── Tool Handlers ─────────────────────────────────────────────
@@ -45,25 +30,19 @@ export function isBlacklisted(mint) {
 export function addToBlacklist({ mint, symbol, reason }) {
   if (!mint) return { error: "mint required" };
 
-  const db = load();
+  const existing = getEntry(mint);
 
-  if (db[mint]) {
+  if (existing) {
     return {
       already_blacklisted: true,
       mint,
-      symbol: db[mint].symbol,
-      reason: db[mint].reason,
+      symbol: existing.symbol,
+      reason: existing.reason,
     };
   }
 
-  db[mint] = {
-    symbol: symbol || "UNKNOWN",
-    reason: reason || "no reason provided",
-    added_at: new Date().toISOString(),
-    added_by: "agent",
-  };
-
-  save(db);
+  getDb().prepare("INSERT INTO token_blacklist (mint, symbol, reason, added_at, added_by) VALUES (?, ?, ?, ?, ?)")
+    .run(mint, symbol || "UNKNOWN", reason || "no reason provided", new Date().toISOString(), "agent");
   log("blacklist", `Blacklisted ${symbol || mint}: ${reason}`);
   return { blacklisted: true, mint, symbol, reason };
 }
@@ -74,15 +53,13 @@ export function addToBlacklist({ mint, symbol, reason }) {
 export function removeFromBlacklist({ mint }) {
   if (!mint) return { error: "mint required" };
 
-  const db = load();
+  const entry = getEntry(mint);
 
-  if (!db[mint]) {
+  if (!entry) {
     return { error: `Mint ${mint} not found on blacklist` };
   }
 
-  const entry = db[mint];
-  delete db[mint];
-  save(db);
+  getDb().prepare("DELETE FROM token_blacklist WHERE mint = ?").run(mint);
   log("blacklist", `Removed ${entry.symbol || mint} from blacklist`);
   return { removed: true, mint, was: entry };
 }
@@ -91,11 +68,8 @@ export function removeFromBlacklist({ mint }) {
  * Tool handler: list_blacklist
  */
 export function listBlacklist() {
-  const db = load();
-  const entries = Object.entries(db).map(([mint, info]) => ({
-    mint,
-    ...info,
-  }));
+  const entries = getDb().prepare("SELECT mint, symbol, reason, added_at, added_by FROM token_blacklist ORDER BY added_at").all()
+    .map((row) => ({ ...row }));
 
   return {
     count: entries.length,

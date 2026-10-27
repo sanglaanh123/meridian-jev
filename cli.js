@@ -22,24 +22,35 @@ Commands:
   blacklist add --mint ADDRESS [--reason TEXT]
   blacklist remove --mint ADDRESS
   performance [--hours NUMBER]     Read local closed-position history
+  db stats [--hours NUMBER]       PnL breakdown by tier, label and close reason (default 168h)
+  db positions [--open]           Tracked positions from the database
+  db signals                      Scanner signals and entry attempts
+  db decisions [--limit NUMBER]   Recent deploy/close decisions
+  db query "SELECT ..."           Read-only SQL against meridian.db
   config                          Show non-secret strategy and threshold settings
   help
 
 Flags: --dry-run forces all transaction operations to simulate only.
 Configuration: user-config.json (restart the daemon after editing).
+State: meridian.db (SQLite; legacy JSON state files are imported on first open).
 New entries are made only by the Meteora pool scanner after tiered screening;
 there is no manual deploy command.
 `;
 const { values: flags, positionals } = parseArgs({
   allowPositionals: true,
   options: Object.fromEntries([
-    ...['wallet','pool','position','mint','reason','from','to','amount','hours'].map(k => [k, { type: 'string' }]),
-    ...['help','dry-run','skip-swap'].map(k => [k, { type: 'boolean' }]),
+    ...['wallet','pool','position','mint','reason','from','to','amount','hours','limit'].map(k => [k, { type: 'string' }]),
+    ...['help','dry-run','skip-swap','open'].map(k => [k, { type: 'boolean' }]),
   ]),
 });
 if (flags['dry-run']) process.env.DRY_RUN = 'true';
 const out = value => process.stdout.write(JSON.stringify(value, null, 2) + '\n');
 function requireFlag(key) { if (!flags[key]) throw new Error(`--${key} is required`); return flags[key]; }
+function positiveFlag(key, fallback) {
+  const n = Number(flags[key] ?? fallback);
+  if (!Number.isFinite(n) || n <= 0) throw new Error(`--${key} must be positive`);
+  return n;
+}
 async function main() {
   const [cmd = 'help', action] = positionals;
   if (flags.help || cmd === 'help') { process.stdout.write(HELP); return; }
@@ -48,11 +59,8 @@ async function main() {
   switch (cmd) {
     case 'start': return (await import('./standalone/runtime.js')).startStandalone();
     case 'status': {
-      const fs = await import('node:fs');
-      const { repoPath } = await import('./repo-root.js');
-      const file = repoPath('wallet-monitor-state.json');
-      if (!fs.existsSync(file)) return out({ started: false, shadow: config.standalone.shadow });
-      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const { MonitorStore } = await import('./standalone/store.js');
+      const { data } = new MonitorStore();
       return out({ shadow: config.standalone.shadow, tiers: config.screening.enabledTiers, signals: data.signals, attempts: data.attempts });
     }
     case 'balance': return out(await (await import('./tools/wallet.js')).getWalletBalances({ force: true }));
@@ -80,9 +88,23 @@ async function main() {
     }
     case 'performance': {
       const { getPerformanceHistory, getPerformanceSummary } = await import('./performance.js');
-      const hours = Number(flags.hours || 24);
-      if (!Number.isFinite(hours) || hours <= 0) throw new Error('--hours must be positive');
-      return out({ summary: getPerformanceSummary(), recent: getPerformanceHistory({ hours }) });
+      return out({ summary: getPerformanceSummary(), recent: getPerformanceHistory({ hours: positiveFlag('hours', 24) }) });
+    }
+    case 'db': {
+      if (action === 'stats') return out((await import('./performance.js')).getPerformanceBreakdown({ hours: positiveFlag('hours', 168) }));
+      if (action === 'positions') return out((await import('./state.js')).getTrackedPositions(!!flags.open));
+      if (action === 'signals') {
+        const { MonitorStore } = await import('./standalone/store.js');
+        const { signals, attempts } = new MonitorStore().data;
+        return out({ signals, attempts });
+      }
+      if (action === 'decisions') return out((await import('./decision-log.js')).getRecentDecisions(positiveFlag('limit', 20)));
+      if (action === 'query') {
+        const sql = positionals[2];
+        if (!sql) throw new Error('Usage: db query "SELECT ..."');
+        return out((await import('./db.js')).readOnlyQuery(sql));
+      }
+      throw new Error('Use db stats, db positions, db signals, db decisions, or db query');
     }
     case 'config': return out({ shadowMode: config.standalone.shadow, scanner: config.scanner, risk: config.risk, screening: config.screening, jev: config.jev, management: config.management, strategy: config.strategy, schedule: config.schedule });
     default: throw new Error(`Unknown command "${cmd}". Run meridian help. Legacy commands are archived on the legacy branch.`);

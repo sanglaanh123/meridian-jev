@@ -14,7 +14,8 @@ The app is a bluechip and mid-cap Meteora DLMM farmer (token-X / SOL pools). Ent
 - `standalone/indicators.js`: pure trend/range indicators ported from the user's MTA-HedgeB (efficiency ratio) and M-EMA-Bot (ER regime, SMC BOS/CHoCH structure, ATR ZLEMA) plus ADX/ATR; `INDICATOR_GATES` / `INDICATOR_EXITS` are shared by screening (entry gate), `manageOnce` (exit, slow pass only) and `scripts/indicator-lab.js`. Per-label choice: `labelIndicators`.
 - `standalone/labels.js`: coin label set and loader for `coin-labels.json` (user-editable, git-ignored); `scripts/label-coins.js` lists coins and suggests labels.
 - `scripts/backtest.js`, `scripts/strategy-lab.js`, `scripts/tune.js`, `scripts/binstep-lab.js`, `scripts/label-coins.js` (+ `backtest-sim.js`, `policy.js`, `history.js`, `lab-data.js`): read-only research on Meteora history; cache in `.backtest-cache/`.
-- `standalone/store.js`: persisted signals, cooldowns, and recovery attempts (`wallet-monitor-state.json`; legacy wallet keys are dropped on load).
+- `db.js`: the SQLite store (`node:sqlite`, `meridian.db`, override `MERIDIAN_DB`): connection, schema migrations, document-row mapping, read-only queries, and the one-time import of legacy JSON state files. Nothing opens on import.
+- `standalone/store.js`: persisted signals, cooldowns, and recovery attempts (`signals`/`attempts` tables; `data` is the in-memory working copy, `save()` rewrites both atomically).
 - `standalone/screening.js`: tier selection plus Jupiter token rules, Meteora pool rules, on-chain mint checks, and `choosePool` (the coin label's `labelPoolRules`: fee24 | tvl | fit | largest | smallest picks which of the mint's pools / bin steps to farm).
 - `standalone/judgment.js`: optional Jev (TypeSafe) bluechip classifier (`off`/`shadow`/`veto`/`approve`); no network on import.
 - `standalone/balances.js`, `standalone/rpc.js`: standard RPC balances, cached prices, read fallback.
@@ -25,7 +26,7 @@ The app is a bluechip and mid-cap Meteora DLMM farmer (token-X / SOL pools). Ent
 - `tools/wallet.js`: balances and direct Jupiter swaps.
 - `secret-key.js`: the single wallet-secret parser (base58, byte array, hex, seed).
 - `exit-rules.js`, `state.js`: deterministic rules (tier stop loss, volatility × bin-step range sizing) and position tracking.
-- `performance.js`: local performance accounting, written to `lessons.json` with the tier, signal source and Jev answers.
+- `performance.js`: local performance accounting (`performance` table) with the tier, signal source and Jev answers; `getPerformanceBreakdown` feeds `cli.js db stats` and the Telegram Stats view.
 - `pool-memory.js`, `token-blacklist.js`, `dev-blocklist.js`: local history and safety filters.
 - `telegram.js`, `standalone/telegram-admin.js`: notifications and the admin console.
 
@@ -45,7 +46,7 @@ The app is a bluechip and mid-cap Meteora DLMM farmer (token-X / SOL pools). Ent
 
 ## Configuration and state
 
-`config.js` loads `user-config.json` once. `validateConfig()` refuses to start on an invalid `jevMode` or an unknown tier. The example file documents supported settings. Restart after changes. Secrets belong in environment variables or `.env`; never commit them. Keep existing ignored JSON state and logs intact.
+`config.js` loads `user-config.json` once. `validateConfig()` refuses to start on an invalid `jevMode` or an unknown tier. The example file documents supported settings. Restart after changes. Secrets belong in environment variables or `.env`; never commit them. All runtime state lives in `meridian.db`; legacy JSON state is imported once and kept as `*.migrated`. Keep the database, `.migrated` files and logs intact. Tests use a temp database via `MERIDIAN_DB` (set in `test/setup-env.js`).
 
 ## Checks
 

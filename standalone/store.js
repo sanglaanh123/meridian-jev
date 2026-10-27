@@ -1,20 +1,21 @@
-import fs from 'node:fs';
-import { repoPath } from '../repo-root.js';
+import { getDb, putDoc, getKv, setKv, tx } from '../db.js';
 
-// Keys left over from the retired smart-wallet monitor; dropped on load.
-const LEGACY_KEYS = ['wallets', 'pending', 'seen', 'events'];
+const byKey = table => Object.fromEntries(getDb().prepare(`SELECT mint, data FROM ${table}`).all().map(r => [r.mint, JSON.parse(r.data)]));
 
+// Signals and attempts live in SQLite (db.js). `data` stays the in-memory working
+// copy: callers mutate it directly and call save(), which rewrites both tables atomically.
 export class MonitorStore {
-  constructor(file = repoPath('wallet-monitor-state.json')) {
-    this.file = file;
-    this.data = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : { version: 1, signals: {}, attempts: {} };
-    if (this.data.version !== 1 || !this.data.attempts || typeof this.data.attempts !== 'object') throw new Error('Invalid monitor state; refusing to discard recovery history');
-    this.data.signals ??= {};
-    for (const key of LEGACY_KEYS) delete this.data[key];
+  constructor() {
+    this.data = { ...(getKv('monitor_extras') ?? {}), version: 1, signals: byKey('signals'), attempts: byKey('attempts') };
   }
   save() {
-    fs.writeFileSync(`${this.file}.tmp`, JSON.stringify(this.data, null, 2), { mode: 0o600 });
-    fs.renameSync(`${this.file}.tmp`, this.file);
+    const { version, signals, attempts, ...extras } = this.data;
+    tx(db => {
+      db.exec('DELETE FROM signals; DELETE FROM attempts;');
+      for (const [mint, s] of Object.entries(signals)) putDoc('signals', mint, s);
+      for (const [mint, a] of Object.entries(attempts)) putDoc('attempts', mint, a);
+      setKv('monitor_extras', extras);
+    });
   }
   prune(now = Date.now()) {
     for (const [mint, s] of Object.entries(this.data.signals)) if (s.done && now - s.createdAt > 24 * 3600_000 && !(now < s.cooldownUntil)) delete this.data.signals[mint];

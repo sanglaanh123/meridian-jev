@@ -1,25 +1,4 @@
-import fs from "fs";
-import { log } from "./logger.js";
-import { repoPath } from "./repo-root.js";
-
-const DECISION_LOG_FILE = repoPath("decision-log.json");
-const MAX_DECISIONS = 100;
-
-function load() {
-  if (!fs.existsSync(DECISION_LOG_FILE)) {
-    return { decisions: [] };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(DECISION_LOG_FILE, "utf8"));
-  } catch (error) {
-    log("decision_log_warn", `Invalid ${DECISION_LOG_FILE}: ${error.message}`);
-    return { decisions: [] };
-  }
-}
-
-function save(data) {
-  fs.writeFileSync(DECISION_LOG_FILE, JSON.stringify(data, null, 2));
-}
+import { putDoc, listDocs } from "./db.js";
 
 function sanitize(value, maxLen = 280) {
   if (value == null) return null;
@@ -27,7 +6,6 @@ function sanitize(value, maxLen = 280) {
 }
 
 export function appendDecision(entry) {
-  const data = load();
   const decision = {
     id: `dec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     ts: new Date().toISOString(),
@@ -42,15 +20,12 @@ export function appendDecision(entry) {
     metrics: entry.metrics || {},
     rejected: Array.isArray(entry.rejected) ? entry.rejected.map((r) => sanitize(r, 180)).filter(Boolean).slice(0, 8) : [],
   };
-  data.decisions.unshift(decision);
-  data.decisions = data.decisions.slice(0, MAX_DECISIONS);
-  save(data);
+  putDoc("decisions", decision.id, decision);
   return decision;
 }
 
 export function getRecentDecisions(limit = 10) {
-  const data = load();
-  return (data.decisions || []).slice(0, limit);
+  return listDocs("decisions", "ORDER BY ts DESC, rowid DESC LIMIT ?", limit);
 }
 
 export function getDecisionSummary(limit = 6) {

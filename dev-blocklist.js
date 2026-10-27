@@ -6,62 +6,42 @@
  * before focused screening can approve a token.
  */
 
-import fs from "fs";
 import { log } from "./logger.js";
-import { repoPath } from "./repo-root.js";
+import { getDb } from "./db.js";
 
-const BLOCKLIST_FILE = repoPath("dev-blocklist.json");
-
-function load() {
-  if (!fs.existsSync(BLOCKLIST_FILE)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(BLOCKLIST_FILE, "utf8"));
-  } catch (error) {
-    log("dev_blocklist_error", `Invalid ${BLOCKLIST_FILE}: ${error.message}`);
-    throw new Error(`Safety blocklist is unreadable: ${BLOCKLIST_FILE}`);
-  }
-}
-
-function save(data) {
-  fs.writeFileSync(BLOCKLIST_FILE, JSON.stringify(data, null, 2));
-}
+// Read errors propagate: an unreadable blocklist must fail closed.
+const getEntry = (wallet) => getDb().prepare("SELECT label, reason, added_at FROM dev_blocklist WHERE wallet = ?").get(wallet);
 
 export function isDevBlocked(devWallet) {
   if (!devWallet) return false;
-  return !!load()[devWallet];
+  return !!getEntry(devWallet);
 }
 
 export function getBlockedDevs() {
-  return load();
+  return Object.fromEntries(getDb().prepare("SELECT wallet, label, reason, added_at FROM dev_blocklist").all()
+    .map(({ wallet, ...info }) => [wallet, info]));
 }
 
 export function blockDev({ wallet, reason, label }) {
   if (!wallet) return { error: "wallet required" };
-  const db = load();
-  if (db[wallet]) return { already_blocked: true, wallet, label: db[wallet].label, reason: db[wallet].reason };
-  db[wallet] = {
-    label: label || "unknown",
-    reason: reason || "no reason provided",
-    added_at: new Date().toISOString(),
-  };
-  save(db);
+  const existing = getEntry(wallet);
+  if (existing) return { already_blocked: true, wallet, label: existing.label, reason: existing.reason };
+  getDb().prepare("INSERT INTO dev_blocklist (wallet, label, reason, added_at) VALUES (?, ?, ?, ?)")
+    .run(wallet, label || "unknown", reason || "no reason provided", new Date().toISOString());
   log("dev_blocklist", `Blocked deployer ${label || wallet}: ${reason}`);
   return { blocked: true, wallet, label, reason };
 }
 
 export function unblockDev({ wallet }) {
   if (!wallet) return { error: "wallet required" };
-  const db = load();
-  if (!db[wallet]) return { error: `Wallet ${wallet} not on dev blocklist` };
-  const entry = db[wallet];
-  delete db[wallet];
-  save(db);
+  const entry = getEntry(wallet);
+  if (!entry) return { error: `Wallet ${wallet} not on dev blocklist` };
+  getDb().prepare("DELETE FROM dev_blocklist WHERE wallet = ?").run(wallet);
   log("dev_blocklist", `Removed deployer ${entry.label || wallet} from blocklist`);
   return { unblocked: true, wallet, was: entry };
 }
 
 export function listBlockedDevs() {
-  const db = load();
-  const entries = Object.entries(db).map(([wallet, info]) => ({ wallet, ...info }));
+  const entries = Object.entries(getBlockedDevs()).map(([wallet, info]) => ({ wallet, ...info }));
   return { count: entries.length, blocked_devs: entries };
 }

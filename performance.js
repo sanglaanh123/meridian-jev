@@ -1,8 +1,6 @@
-// Local closed-position accounting. Existing lessons.json history is preserved.
-import fs from "node:fs";
+// Local closed-position accounting in the SQLite performance table (db.js).
 import { log } from "./logger.js";
-import { repoPath } from "./repo-root.js";
-const LESSONS_FILE = repoPath("lessons.json");
+import { getDb, getDoc, putDoc, listDocs } from "./db.js";
 const PERFORMANCE_SIGNAL_FIELDS = [
   "organic_score",
   "fee_tvl_ratio",
@@ -19,21 +17,6 @@ const PERFORMANCE_SIGNAL_FIELDS = [
   "entry_volume",
 ];
 
-function load() {
-  if (!fs.existsSync(LESSONS_FILE)) {
-    return { lessons: [], performance: [] };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(LESSONS_FILE, "utf8"));
-  } catch {
-    return { lessons: [], performance: [] };
-  }
-}
-
-function save(data) {
-  fs.writeFileSync(LESSONS_FILE, JSON.stringify(data, null, 2));
-}
-
 function buildSignalSnapshot(perf) {
   const snapshot = { ...(perf.signal_snapshot || {}) };
   if (perf.base_mint && snapshot.base_mint == null) snapshot.base_mint = perf.base_mint;
@@ -49,7 +32,7 @@ function buildSignalSnapshot(perf) {
 function lookupAttempt(mint) {
   if (!mint) return {};
   try {
-    const attempt = JSON.parse(fs.readFileSync(repoPath("wallet-monitor-state.json"), "utf8")).attempts?.[mint];
+    const attempt = getDoc("attempts", mint);
     if (!attempt) return {};
     return {
       ...(attempt.source ? { signal_source: attempt.source } : {}),
@@ -63,8 +46,6 @@ function lookupAttempt(mint) {
 }
 
 export async function recordPerformance(perf) {
-  const data = load();
-
   // Guard against unit-mixed records where a SOL-sized final value is
   // accidentally written into a USD field (e.g. final_value_usd = 2 for a 2 SOL close).
   const suspiciousUnitMix =
@@ -112,9 +93,7 @@ export async function recordPerformance(perf) {
     recorded_at: new Date().toISOString(),
   };
 
-  data.performance.push(entry);
-
-  save(data);
+  putDoc("performance", null, entry);
 
   // Update pool-level memory
   if (perf.pool) {
@@ -146,16 +125,12 @@ export async function recordPerformance(perf) {
 }
 
 export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
-  const data = load();
-  const p = data.performance;
-
-  if (p.length === 0) return { positions: [], count: 0, hours };
-
   const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  const rows = listDocs("performance", "WHERE recorded_at >= ? ORDER BY id DESC LIMIT ?", cutoff, limit).reverse();
 
-  const filtered = p
-    .filter((r) => r.recorded_at >= cutoff)
-    .slice(-limit)
+  if (rows.length === 0) return { positions: [], count: 0, hours };
+
+  const filtered = rows
     .map((r) => ({
       pool_name: r.pool_name,
       pool: r.pool,
@@ -182,8 +157,7 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
 }
 
 export function getPerformanceSummary() {
-  const data = load();
-  const p = data.performance;
+  const p = listDocs("performance");
 
   if (p.length === 0) return null;
 
@@ -198,5 +172,38 @@ export function getPerformanceSummary() {
     avg_pnl_pct: Math.round(avgPnlPct * 100) / 100,
     avg_range_efficiency_pct: Math.round(avgRangeEfficiency * 10) / 10,
     win_rate_pct: Math.round((wins / p.length) * 100),
+  };
+}
+
+const PNL_AGGREGATE = "COUNT(*) AS n, SUM(pnl_usd) AS pnl, AVG(pnl_pct) AS avg_pct, SUM(pnl_usd > 0) AS wins";
+const aggregate = (row) => ({
+  count: row.n,
+  total_pnl_usd: Math.round((row.pnl ?? 0) * 100) / 100,
+  avg_pnl_pct: row.avg_pct == null ? null : Math.round(row.avg_pct * 100) / 100,
+  win_rate_pct: row.n > 0 ? Math.round((row.wins / row.n) * 100) : null,
+});
+
+/** Closed-position PnL over the window, overall and grouped by tier, label and close reason. */
+export function getPerformanceBreakdown({ hours = 168 } = {}) {
+  const db = getDb();
+  const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  const groupBy = (col) => db
+    .prepare(`SELECT COALESCE(${col}, 'unknown') AS key, ${PNL_AGGREGATE} FROM performance WHERE recorded_at >= ? GROUP BY key ORDER BY pnl DESC`)
+    .all(cutoff)
+    .map((row) => ({ key: row.key, ...aggregate(row) }));
+  return {
+    hours,
+    ...aggregate(db.prepare(`SELECT ${PNL_AGGREGATE} FROM performance WHERE recorded_at >= ?`).get(cutoff)),
+    by_tier: groupBy("tier"),
+    by_label: groupBy("label"),
+    by_close_reason: groupBy("close_reason"),
+    recent: listDocs("performance", "ORDER BY id DESC LIMIT 5").map((r) => ({
+      pool_name: r.pool_name ?? r.pool,
+      tier: r.tier ?? null,
+      pnl_usd: r.pnl_usd,
+      pnl_pct: r.pnl_pct,
+      close_reason: r.close_reason ?? null,
+      closed_at: r.recorded_at,
+    })),
   };
 }

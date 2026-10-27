@@ -18,7 +18,11 @@ gmgn-config.json
 # Stray Claude Code worktrees
 .claude/worktrees/
 
-# Runtime state (position tracking, lessons — user-specific)
+# Runtime state (SQLite database and legacy JSON stores — user-specific)
+meridian.db
+meridian.db-wal
+meridian.db-shm
+*.migrated
 state.json
 lessons.json
 smart-wallets.json

@@ -20,6 +20,12 @@ import { realizedVolatility } from "../standalone/meteora.js";
 import { listFilter, preselect, interleaveTiers, scanOnce } from "../standalone/scanner.js";
 import { withWalletLock } from "../standalone/transactions.js";
 import { getDeterministicCloseRule, computeBinsBelow } from "../exit-rules.js";
+import { closeDb, getKv, readOnlyQuery } from "../db.js";
+import { trackPosition, recordClose, getTrackedPositions, getStateSummary, syncOpenPositions } from "../state.js";
+import { recordPerformance, getPerformanceBreakdown, getPerformanceHistory } from "../performance.js";
+import { recordPoolDeploy, isPoolOnCooldown, isBaseMintOnCooldown, getPoolMemory } from "../pool-memory.js";
+import { isBlacklisted, addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
+import { appendDecision, getRecentDecisions } from "../decision-log.js";
 
 const options = { screeningDeadlineSec: 120, cooldownSec: 3600 };
 
@@ -34,7 +40,14 @@ const MINT = "Mint111111111111111111111111111111111111111";
 const POOL_A = "Po01AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const S = config.screening;
 const BLUE = S.tiers.bluechip, MID = S.tiers.midcap;
-const tempStore = () => new MonitorStore(path.join(fs.mkdtempSync(path.join(os.tmpdir(), "mer-")), "state.json"));
+// Each call points db.js at a fresh SQLite file in its own temp dir; returns that dir.
+const useTempDb = () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mer-"));
+  closeDb();
+  process.env.MERIDIAN_DB = path.join(dir, "meridian.db");
+  return dir;
+};
+const tempStore = () => { useTempDb(); return new MonitorStore(); };
 
 // JUP-like bluechip token and its SOL pool; override per case.
 const token = (o = {}, now = Date.now()) => ({
@@ -208,24 +221,72 @@ console.log("\n[9] acceptPoolSignal / finishSignal / finishStaleSignals / store 
   check("stale signal cleared with a cooldown", n === 1 && stale.data.signals.stuck.done && stale.data.signals.stuck.cooldownUntil === now + options.cooldownSec * 1000);
   check("done signals unchanged", JSON.stringify(stale.data.signals.fine) === before);
 
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mer-"));
-  const legacy = path.join(dir, "legacy.json");
+  const dir = useTempDb();
+  const legacy = path.join(dir, "wallet-monitor-state.json");
   fs.writeFileSync(legacy, JSON.stringify({ version: 1, wallets: { W: {} }, pending: { k: {} }, seen: { k: 1 }, events: [{ id: 1 }], signals: {}, attempts: { [MINT]: { at: now, status: "entered" } }, paused: false }));
-  const migrated = new MonitorStore(legacy);
+  const migrated = new MonitorStore();
+  const extras = getKv("monitor_extras");
+  check("legacy JSON imported: attempts kept, retired keys dropped, extras kept", migrated.data.attempts[MINT]?.status === "entered" && !("wallets" in migrated.data) && !("events" in extras) && extras.paused === false);
+  check("imported JSON renamed to .migrated", !fs.existsSync(legacy) && fs.existsSync(`${legacy}.migrated`));
   migrated.save();
-  const saved = JSON.parse(fs.readFileSync(legacy, "utf8"));
-  check("legacy wallet-monitor keys dropped, attempts kept", !("wallets" in saved) && !("events" in saved) && !("pending" in saved) && saved.attempts[MINT]?.status === "entered");
+  closeDb();
+  check("store round-trips through SQLite", new MonitorStore().data.attempts[MINT]?.status === "entered");
 
   migrated.data.attempts[MINT] = { at: now - 25 * 3600_000, status: "failed" };
   migrated.data.attempts.Other = { at: now - 25 * 3600_000, status: "submitting" };
   migrated.prune(now);
   check("attempts pruned after 24h except mid-submit", migrated.data.attempts[MINT] === undefined && migrated.data.attempts.Other);
 
-  const bad = path.join(dir, "bad.json");
+  const badDir = useTempDb();
+  const bad = path.join(badDir, "wallet-monitor-state.json");
   fs.writeFileSync(bad, JSON.stringify({ version: 99 }));
   let refused = false;
-  try { new MonitorStore(bad); } catch { refused = true; }
-  check("invalid state refused, not discarded", refused);
+  try { new MonitorStore(); } catch { refused = true; }
+  check("invalid state refused, not discarded", refused && fs.existsSync(bad));
+}
+
+// ─── SQLite stores ───────────────────────────────────────────────────────────
+console.log("\n[9b] SQLite stores — positions, performance, pool memory, blacklist, decisions, read-only query");
+{
+  useTempDb();
+  trackPosition({ position: "PosA", pool: POOL_A, pool_name: "TEST-SOL", strategy: "spot", amount_sol: 0.5, tier: "bluechip", label: "calm" });
+  trackPosition({ position: "PosB", pool: POOL_A, pool_name: "TEST-SOL", strategy: "spot", amount_sol: 0.5 });
+  check("tracked positions are open", getTrackedPositions(true).length === 2);
+  recordClose("PosA", "stop loss");
+  const summary = getStateSummary();
+  check("close recorded with events", summary.open_positions === 1 && summary.closed_positions === 1 && summary.recent_events.map(e => e.action).join() === "deploy,deploy,close");
+  syncOpenPositions([]);
+  check("sync keeps positions inside the grace period", getTrackedPositions(true).length === 1);
+
+  const perf = { position: "PosA", pool: POOL_A, pool_name: "TEST-SOL", base_mint: MINT, tier: "bluechip", label: "calm", strategy: "spot", amount_sol: 0.5, initial_value_usd: 100, final_value_usd: 95, fees_earned_usd: 1, minutes_held: 60, minutes_in_range: 30, close_reason: "out of range" };
+  await recordPerformance(perf);
+  await recordPerformance({ ...perf, position: "PosC", final_value_usd: 110, close_reason: "take profit" });
+  const breakdown = getPerformanceBreakdown({ hours: 24 });
+  check("performance breakdown totals", breakdown.count === 2 && breakdown.total_pnl_usd === 7 && breakdown.win_rate_pct === 50, JSON.stringify(breakdown));
+  check("breakdown grouped by tier and reason", breakdown.by_tier[0]?.key === "bluechip" && breakdown.by_close_reason.length === 2);
+  check("performance history window", getPerformanceHistory({ hours: 24 }).count === 2);
+  check("pool memory written from performance", getPoolMemory({ pool_address: POOL_A }).total_deploys === 2);
+
+  recordPoolDeploy("PoolSibling", { pool_name: "SIB-SOL", base_mint: MINT, pnl_pct: 1, close_reason: "take profit" });
+  for (let i = 0; i < 3; i++) recordPoolDeploy(POOL_A, { base_mint: MINT, pnl_pct: -1, close_reason: "out of range" });
+  check("repeated OOR closes cool the pool", isPoolOnCooldown(POOL_A));
+  check("base-mint cooldown reaches sibling pools", isBaseMintOnCooldown(MINT) && getPoolMemory({ pool_address: "PoolSibling" }).base_mint_cooldown_until != null);
+
+  addToBlacklist({ mint: "BadMint", symbol: "BAD", reason: "rug" });
+  check("blacklist add", isBlacklisted("BadMint") && listBlacklist().count === 1 && addToBlacklist({ mint: "BadMint" }).already_blacklisted);
+  removeFromBlacklist({ mint: "BadMint" });
+  check("blacklist remove", !isBlacklisted("BadMint") && listBlacklist().count === 0);
+
+  appendDecision({ type: "deploy", summary: "first" });
+  appendDecision({ type: "close", summary: "second" });
+  check("decisions newest first", getRecentDecisions(2).map(d => d.summary).join() === "second,first");
+
+  check("read-only query returns rows", readOnlyQuery("SELECT COUNT(*) AS n FROM positions")[0]?.n === 2);
+  let blocked = 0;
+  for (const sql of ["DELETE FROM positions", "WITH x AS (SELECT 1) DELETE FROM positions"]) {
+    try { readOnlyQuery(sql); } catch { blocked++; }
+  }
+  check("read-only query rejects writes", blocked === 2 && readOnlyQuery("SELECT COUNT(*) AS n FROM positions")[0]?.n === 2);
 }
 
 // ─── Scanner ─────────────────────────────────────────────────────────────────
