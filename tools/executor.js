@@ -6,141 +6,36 @@ import { config, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { addPoolNote } from "../pool-memory.js";
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
-const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
-const MIN_VOLATILITY_TIMEFRAME = "30m";
-const TIMEFRAME_MINUTES = { "5m": 5, "30m": 30, "1h": 60, "2h": 120, "4h": 240, "12h": 720, "24h": 1440 };
-
+import { poolWithVolatility } from "../standalone/meteora.js";
+import { rejectPool } from "../standalone/screening.js";
 function numberOrNull(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
 
-function getVolatilityTimeframe(sourceTimeframe) {
-  const source = String(sourceTimeframe || "").trim();
-  const sourceMinutes = TIMEFRAME_MINUTES[source];
-  const minMinutes = TIMEFRAME_MINUTES[MIN_VOLATILITY_TIMEFRAME];
-  return sourceMinutes != null && sourceMinutes >= minMinutes ? source : MIN_VOLATILITY_TIMEFRAME;
-}
-
-function poolDetailTvl(pool) {
-  return numberOrNull(pool?.tvl ?? pool?.active_tvl ?? pool?.liquidity);
-}
-
-function poolDetailBinStep(pool) {
-  return numberOrNull(pool?.dlmm_params?.bin_step ?? pool?.pool_config?.bin_step);
-}
-
-function poolDetailFeeActiveTvlRatio(pool) {
-  return numberOrNull(pool?.fee_active_tvl_ratio);
-}
-
-function poolDetailVolatility(pool) {
-  return numberOrNull(pool?.volatility);
-}
-
-async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.timeframe || "5m") {
-  const encodedTimeframe = encodeURIComponent(timeframe);
-  const filter = encodeURIComponent(`pool_address=${poolAddress}`);
-  const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${filter}&timeframe=${encodedTimeframe}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-  if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
-  const data = await res.json();
-  return (data?.data || [])[0] ?? null;
-}
-
+// Last gate before any transaction: a fresh Meteora read of the pool must still
+// pass the tier rules the entry was screened under (volatility from fresh candles).
 async function validateDeployPoolThresholds(args) {
+  const tier = config.screening.tiers[args.tier];
+  if (!tier) return { pass: false, reason: `Deploy requires a screened tier (got ${args.tier ?? "none"})` };
   let detail;
   try {
-    detail = await fetchFreshPoolDetail(args.pool_address);
-    if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
+    detail = await poolWithVolatility(args.pool_address);
   } catch (error) {
-    return {
-      pass: false,
-      reason: `Could not verify pool screening thresholds before deploy: ${error.message}`,
-    };
+    return { pass: false, reason: `Could not verify pool screening thresholds before deploy: ${error.message}` };
   }
-
-  const tvl = poolDetailTvl(detail);
-  const minTvl = numberOrNull(config.screening.minTvl);
-  const maxTvl = numberOrNull(config.screening.maxTvl);
-  if (tvl == null) {
-    return {
-      pass: false,
-      reason: "Could not verify pool TVL before deploy.",
-    };
-  }
-  if (minTvl != null && minTvl > 0 && tvl < minTvl) {
-    return {
-      pass: false,
-      reason: `Pool TVL $${tvl} is below configured minTvl $${minTvl}.`,
-    };
-  }
-  if (maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
-    return {
-      pass: false,
-      reason: `Pool TVL $${tvl} is above configured maxTvl $${maxTvl}.`,
-    };
-  }
-
-  const feeActiveTvlRatio = poolDetailFeeActiveTvlRatio(detail);
-  const minFeeActiveTvlRatio = numberOrNull(config.screening.minFeeActiveTvlRatio);
-  if (
-    minFeeActiveTvlRatio != null &&
-    minFeeActiveTvlRatio > 0 &&
-    (feeActiveTvlRatio == null || feeActiveTvlRatio < minFeeActiveTvlRatio)
-  ) {
-    return {
-      pass: false,
-      reason: `Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
-    };
-  }
-
-  const volatilityTimeframe = getVolatilityTimeframe(config.screening.timeframe || "5m");
-  let volatilityDetail = detail;
-  if ((config.screening.timeframe || "5m") !== volatilityTimeframe) {
-    try {
-      volatilityDetail = await fetchFreshPoolDetail(args.pool_address, volatilityTimeframe);
-    } catch (error) {
-      return {
-        pass: false,
-        reason: `Could not verify pool ${volatilityTimeframe} volatility before deploy: ${error.message}`,
-      };
-    }
-  }
-
-  const volatility = poolDetailVolatility(volatilityDetail);
-  if (volatility == null || volatility <= 0) {
-    return {
-      pass: false,
-      reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
-    };
-  }
-
-  const actualBinStep = poolDetailBinStep(detail);
-  const minStep = numberOrNull(config.screening.minBinStep);
-  const maxStep = numberOrNull(config.screening.maxBinStep);
-  if (actualBinStep != null && minStep != null && actualBinStep < minStep) {
-    return {
-      pass: false,
-      reason: `Pool bin_step ${actualBinStep} is below configured minBinStep ${minStep}.`,
-    };
-  }
-  if (actualBinStep != null && maxStep != null && actualBinStep > maxStep) {
-    return {
-      pass: false,
-      reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
-    };
-  }
-
-  const baseMint = detail?.token_x?.address || detail?.base_token_address || null;
-  const entryMarketData = {
-    entry_mcap: numberOrNull(detail?.token_x?.market_cap ?? detail?.base_token_market_cap),
-    entry_tvl: tvl,
-    entry_volume: numberOrNull(detail?.volume),
-    entry_holders: numberOrNull(detail?.base_token_holders ?? detail?.token_x?.holders),
+  const why = rejectPool(detail, detail?.token_x?.address, tier, config.screening);
+  if (why) return { pass: false, reason: `Pool failed ${args.tier} rules before deploy: ${why}` };
+  return {
+    pass: true,
+    entryMarketData: {
+      entry_mcap: numberOrNull(detail.token_x?.market_cap),
+      entry_tvl: numberOrNull(detail.tvl),
+      entry_volume: numberOrNull(detail.volume?.["24h"]),
+      entry_holders: numberOrNull(detail.token_x?.holders),
+      base_mint: detail.token_x?.address,
+    },
   };
-
-  return { pass: true, entryMarketData };
 }
 
 const toolMap = {
@@ -302,21 +197,11 @@ async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
       if (typeof args.before_submit !== "function") {
-        return { pass: false, reason: "Entries require a fresh wallet-convergence signal" };
+        return { pass: false, reason: "Entries require a fresh scanner signal" };
       }
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
       if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);
-
-      // Reject pools with bin_step out of configured range
-      const minStep = config.screening.minBinStep;
-      const maxStep = config.screening.maxBinStep;
-      if (args.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
-        return {
-          pass: false,
-          reason: `bin_step ${args.bin_step} is outside the allowed range of [${minStep}-${maxStep}].`,
-        };
-      }
 
       const deployAmountY = Number(args.amount_y ?? args.amount_sol ?? 0);
       const deployAmountX = Number(args.amount_x ?? 0);

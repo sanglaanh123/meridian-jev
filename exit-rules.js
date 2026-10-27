@@ -22,10 +22,13 @@ export function getDeterministicCloseRule(position, managementConfig) {
     return false;
   })();
 
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
+  // The tier recorded at entry may tighten the stop; the global value is the fallback.
+  const stopLossPct = tracked && "stop_loss_pct" in tracked ? tracked.stop_loss_pct : config.screening.tiers[tracked?.tier]?.stopLossPct ?? managementConfig.stopLossPct;
+  if (!pnlSuspect && position.pnl_pct != null && stopLossPct != null && position.pnl_pct <= stopLossPct) {
     return { action: "CLOSE", rule: 1, reason: "stop loss" };
   }
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
+  // takeProfitPct null = off: long farming lets fees accrue instead of capping upside.
+  if (!pnlSuspect && position.pnl_pct != null && managementConfig.takeProfitPct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
   }
   if (
@@ -39,7 +42,7 @@ export function getDeterministicCloseRule(position, managementConfig) {
     position.active_bin != null &&
     position.upper_bin != null &&
     position.active_bin > position.upper_bin &&
-    (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
+    (position.minutes_out_of_range ?? 0) >= (tracked?.oor_wait_minutes ?? managementConfig.outOfRangeWaitMinutes)
   ) {
     return { action: "CLOSE", rule: 4, reason: "OOR" };
   }
@@ -54,15 +57,16 @@ export function getDeterministicCloseRule(position, managementConfig) {
 }
 
 /**
- * Volatility-scaled bins below active bin, clamped to the configured range.
- * Throws on unknown volatility — never deploy a blind fixed range.
+ * Bins below the active bin so the range covers `rangeVolMult` × daily volatility
+ * at this pool's bin step, clamped to the configured range (35-bin floor).
+ * Throws on unknown inputs — never deploy a blind fixed range.
  */
-export function computeBinsBelow(volatility) {
-  const parsedVolatility = Number(volatility);
-  if (!Number.isFinite(parsedVolatility) || parsedVolatility <= 0) {
-    throw new Error(`Invalid volatility ${volatility ?? "unknown"} — refusing volatility-scaled deploy.`);
-  }
-  const lo = config.strategy.minBinsBelow;
-  const hi = config.strategy.maxBinsBelow;
-  return Math.max(lo, Math.min(hi, Math.round(lo + (parsedVolatility / 5) * (hi - lo))));
+export function computeBinsBelow(dailyVolPct, binStep, rangeVolMult = 2) {
+  const vol = Number(dailyVolPct), step = Number(binStep), mult = Number(rangeVolMult);
+  if (!Number.isFinite(vol) || vol <= 0) throw new Error(`Invalid volatility ${dailyVolPct ?? "unknown"} — refusing volatility-scaled deploy.`);
+  if (!Number.isFinite(step) || step <= 0) throw new Error(`Invalid bin step ${binStep ?? "unknown"} — refusing deploy.`);
+  if (!Number.isFinite(mult) || mult <= 0) throw new Error(`Invalid rangeVolMult ${rangeVolMult}`);
+  const targetPct = Math.min(95, mult * vol); // a downside range cannot exceed -100%
+  const bins = Math.ceil(-Math.log(1 - targetPct / 100) / Math.log(1 + step / 10_000));
+  return Math.max(config.strategy.minBinsBelow, Math.min(config.strategy.maxBinsBelow, bins));
 }

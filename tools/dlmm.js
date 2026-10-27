@@ -5,7 +5,7 @@ import {
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import BN from "bn.js";
-import bs58 from "bs58";
+import { parseSecretKey } from "../secret-key.js";
 import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import {
@@ -23,6 +23,7 @@ import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
+import { getPool as getMeteoraPool } from "../standalone/meteora.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -85,7 +86,7 @@ function getWallet() {
     if (!process.env.WALLET_PRIVATE_KEY) {
       throw new Error("WALLET_PRIVATE_KEY not set");
     }
-    _wallet = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY));
+    _wallet = parseSecretKey(process.env.WALLET_PRIVATE_KEY);
     log("init", `Wallet: ${_wallet.publicKey.toString()}`);
   }
   return _wallet;
@@ -239,11 +240,15 @@ export async function deployPosition({
   entry_tvl,
   entry_volume,
   entry_holders,
+  tier,
+  label,
+  stop_loss_pct,
+  oor_wait_minutes,
   before_submit,
   on_prepared,
 }) {
   pool_address = normalizeMint(pool_address);
-  if (typeof before_submit !== "function") throw new Error("Deploy requires a wallet-signal recheck (before_submit)");
+  if (typeof before_submit !== "function") throw new Error("Deploy requires a fresh scanner-signal recheck (before_submit)");
   const activeStrategy = strategy || config.strategy.strategy;
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
@@ -490,6 +495,10 @@ export async function deployPosition({
       entry_tvl,
       entry_volume,
       entry_holders,
+      tier,
+      label,
+      stop_loss_pct,
+      oor_wait_minutes,
     });
 
     appendDecision({
@@ -1172,13 +1181,12 @@ export async function closePosition({ position_address, reason }) {
 
       let exitMarket = {};
       try {
-        const exitDetail = await fetch(`https://pool-discovery-api.datapi.meteora.ag/pools?page_size=1&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}&timeframe=${encodeURIComponent(config.screening?.timeframe || "5m")}`).then(r => r.json()).catch(() => null);
-        const ep = exitDetail?.data?.[0];
+        const ep = await getMeteoraPool(poolAddress).catch(() => null);
         if (ep) {
           exitMarket = {
             exit_mcap: parseFloat(ep?.token_x?.market_cap) || null,
-            exit_tvl: parseFloat(ep?.tvl ?? ep?.active_tvl) || null,
-            exit_volume: parseFloat(ep?.volume) || null,
+            exit_tvl: parseFloat(ep?.tvl) || null,
+            exit_volume: parseFloat(ep?.volume?.["24h"]) || null,
           };
         }
       } catch { /* non-blocking */ }
@@ -1206,6 +1214,7 @@ export async function closePosition({ position_address, reason }) {
         entry_tvl: tracked.entry_tvl ?? null,
         entry_volume: tracked.entry_volume ?? null,
         entry_holders: tracked.entry_holders ?? null,
+        tier: tracked.tier ?? null,
         ...exitMarket,
       });
 

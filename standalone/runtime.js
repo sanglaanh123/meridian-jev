@@ -1,23 +1,25 @@
-// Standalone orchestrator: monitor → convergence signal → focused screening →
-// revalidated deploy → deterministic exits. No Meridian server, no LLM authority.
+// Standalone orchestrator: Meteora pool scanner → tiered bluechip/mid-cap
+// screening → revalidated deploy → deterministic exits. No LLM authority.
 //
 // Entry and exit paths are independent: exits keep running while a signal is
 // being screened, and wallet mutations are serialized by the wallet lock
 // (close_position > other writes > deploy_position) in standalone/transactions.js.
 
 import fs from "node:fs";
-import { config, computeDeployAmount } from "../config.js";
+import { config, computeDeployAmount, validateConfig } from "../config.js";
 import { log } from "../logger.js";
 import { repoPath } from "../repo-root.js";
 import { sendMessage as tgSend, isEnabled as tgEnabled } from "../telegram.js";
-import { MonitorStore, finishSignal } from "./store.js";
-import { WalletMonitor } from "./monitor.js";
-import { screenMint, poolDetail } from "./screening.js";
-import { exposureStillPresent } from "./events.js";
+import { MonitorStore, finishSignal, finishStaleSignals } from "./store.js";
+import { startScanner, stats as scanStats } from "./scanner.js";
+import { screenMint, rejectPool, tierLimits, indicatorsFor, summarizeIndicators } from "./screening.js";
+import { INDICATOR_EXITS } from "./indicators.js";
+import { poolIndicators } from "./meteora.js";
+import { getPool } from "./meteora.js";
 import { getMyPositions } from "../tools/dlmm.js";
 import { executeTool } from "../tools/executor.js";
 import { getWalletBalances } from "../tools/wallet.js";
-import { getTrackedPositions, confirmPeak, updatePnlAndCheckExits, registerExitSignal, syncOpenPositions } from "../state.js";
+import { getTrackedPositions, getTrackedPosition, confirmPeak, updatePnlAndCheckExits, registerExitSignal, syncOpenPositions } from "../state.js";
 import { recordPositionSnapshot } from "../pool-memory.js";
 import { getDeterministicCloseRule, computeBinsBelow } from "../exit-rules.js";
 import { startAdmin } from "./telegram-admin.js";
@@ -25,7 +27,7 @@ import { startAdmin } from "./telegram-admin.js";
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 let store = null;
-let monitor = null;
+let stopScanner = null;
 let lockPath = null;
 let stopAdmin = null;
 let shuttingDown = false;
@@ -55,7 +57,8 @@ async function drainSignals() {
       try {
         await pursueSignal(signal);
       } catch (e) {
-        finishSignal(store, signal, `error: ${e.message}`);
+        // A state-write failure here must never escape as an unhandled rejection.
+        try { finishSignal(store, signal, `error: ${e.message}`, config.standalone); } catch (err) { log("signal_error", `Could not finish signal ${signal.mint.slice(0, 8)}: ${err.message}`); }
         log("signal_error", `Signal ${signal.mint.slice(0, 8)} aborted: ${e.message}`);
       }
     }
@@ -67,8 +70,7 @@ async function drainSignals() {
 // Screen and enter within the signal deadline. Terminal outcomes finish the
 // signal; temporary failures retry every retrySec until the deadline expires.
 async function pursueSignal(signal) {
-  const wallets = signal.events.map(e => `${e.wallet.slice(0, 6)}(◎${e.depositSol.toFixed(1)})`).join(", ");
-  log("signal", `Convergence on ${signal.mint.slice(0, 8)}: ${signal.events.length} wallets [${wallets}] — screening with ${config.standalone.screeningDeadlineSec}s deadline`);
+  log("signal", `Scanner signal on ${signal.mint.slice(0, 8)} [${signal.tier}] pool ${signal.pool?.slice(0, 8)} (${(signal.reasons ?? []).join(", ")}) — screening with ${config.standalone.screeningDeadlineSec}s deadline`);
   let lastReason = "no attempt";
   while (!shuttingDown && !signal.done && Date.now() < signal.deadline) {
     const reason = await attemptEntry(signal);
@@ -78,7 +80,7 @@ async function pursueSignal(signal) {
     if (wait > 0) await sleep(wait);
   }
   if (!signal.done) {
-    finishSignal(store, signal, lastReason);
+    finishSignal(store, signal, lastReason, config.standalone);
     log("signal", `Signal ${signal.mint.slice(0, 8)} expired: ${lastReason}`);
   }
 }
@@ -90,11 +92,11 @@ async function attemptEntry(signal) {
   const attempt = store.data.attempts[mint];
   // One attempt chain per mint; bounded retries only for temporary failures.
   if (attempt && ["entered", "proposed", "submitting"].includes(attempt.status)) {
-    finishSignal(store, signal, `mint already attempted (${attempt.status})`);
+    finishSignal(store, signal, `mint already attempted (${attempt.status})`, config.standalone);
     return null;
   }
   if (attempt?.status === "failed" && (attempt.failures ?? 0) >= 2) {
-    finishSignal(store, signal, "deploy failed repeatedly");
+    finishSignal(store, signal, "deploy failed repeatedly", config.standalone);
     return null;
   }
 
@@ -102,23 +104,37 @@ async function attemptEntry(signal) {
   const positions = await getMyPositions({ force: true }).catch(() => null);
   if (!positions || positions.error || !Array.isArray(positions.positions)) return "position read unavailable";
   if (positions.positions.length >= config.risk.maxPositions) {
-    finishSignal(store, signal, "portfolio full");
+    finishSignal(store, signal, "portfolio full", config.standalone);
     return null;
   }
 
-  // Focused screening: this mint and its eligible pools only.
+  // Focused screening: the signalled pool, re-read fresh.
   let screened;
   try {
-    screened = await screenMint(mint);
+    screened = await screenMint(mint, { poolAddress: signal.pool });
   } catch (e) {
     return `screening error: ${e.message}`;
   }
   if (!screened.pass) {
     if (screened.terminal) {
-      finishSignal(store, signal, `blocked: ${screened.reason}`);
+      finishSignal(store, signal, `blocked: ${screened.reason}`, config.standalone);
       return null;
     }
     return screened.reason;
+  }
+  const tier = screened.tier;
+  const t = config.screening.tiers[tier];
+
+  // Per-tier position cap, counted from the tier recorded at entry.
+  const openByTier = {};
+  for (const p of positions.positions) {
+    const pt = getTrackedPosition(p.position)?.tier;
+    if (pt) openByTier[pt] = (openByTier[pt] ?? 0) + 1;
+  }
+  const limits = tierLimits(openByTier, tier);
+  if (limits.full) {
+    finishSignal(store, signal, `${tier} tier full (${limits.open}/${limits.max})`, config.standalone);
+    return null;
   }
 
   const gate = await finalRecheck(signal, screened);
@@ -126,27 +142,42 @@ async function attemptEntry(signal) {
 
   const balances = await getWalletBalances({ force: true, nativeOnly: true });
   if (balances.error || !Number.isFinite(balances.sol)) return "balance read unavailable";
-  const amountY = computeDeployAmount(balances.sol);
   if (balances.sol < config.management.minSolToOpen + config.management.gasReserve) {
-    finishSignal(store, signal, "insufficient spendable SOL");
+    finishSignal(store, signal, "insufficient spendable SOL", config.standalone);
     return null;
   }
+  // Tier sizing never drops below the configured minimum deploy amount.
+  const amountY = parseFloat(Math.max(config.management.deployAmountSol, computeDeployAmount(balances.sol) * t.sizeMult).toFixed(2));
 
   const pool = screened.pool;
-  const binsBelow = computeBinsBelow(pool.volatility);
+  const binStep = pool.pool_config.bin_step;
+  // Tuned regime entries may override the tier range, stop and OOR wait for this position.
+  const ov = screened.overrides ?? {};
+  const binsBelow = computeBinsBelow(pool.daily_vol_pct, binStep, ov.rangeVolMult ?? t.rangeVolMult);
   // Checkpoint before building anything: a crash mid-sequence leaves a
   // recovery pointer instead of a silent duplicate-entry risk.
   store.data.attempts[mint] = {
-    at: Date.now(), mint, pool: pool.pool_address, wallets: signal.events.map(e => e.wallet),
+    at: Date.now(), mint, pool: pool.address, source: signal.source ?? "meteora", tier, reasons: signal.reasons ?? [],
+    strategy: screened.shape, regime: pool.regime?.key ?? null, label: screened.label ?? null, indicators: screened.indicators ?? null,
     status: "submitting", failures: attempt?.failures ?? 0, position: null, txs: [],
+    ...(screened.jev ? { jev: screened.jev } : {}),
   };
   store.save();
 
   let submitted = 0;
   const result = await executeTool("deploy_position", {
-    pool_address: pool.pool_address,
+    pool_address: pool.address,
+    pool_name: pool.name,
     amount_y: amountY,
     bins_below: binsBelow,
+    strategy: screened.shape,
+    stop_loss_pct: "stopLossPct" in ov ? ov.stopLossPct : t.stopLossPct,
+    oor_wait_minutes: ov.outOfRangeWaitMinutes ?? null,
+    bin_step: binStep,
+    volatility: pool.daily_vol_pct,
+    fee_tvl_ratio: pool.fee_tvl_ratio["24h"],
+    tier,
+    label: screened.label ?? null,
     before_submit: async () => {
       // Gate only the first transaction of the sequence. Once creation has
       // been sent, completing the sequence is safer than abandoning a
@@ -169,10 +200,10 @@ async function attemptEntry(signal) {
     record.txs = result.txs ?? [];
     record.amountSol = amountY;
     store.save();
-    finishSignal(store, signal, record.status === "proposed" ? "shadow proposal recorded" : "entered");
+    finishSignal(store, signal, record.status === "proposed" ? "shadow proposal recorded" : "entered", config.standalone);
     const label = result.dry_run ? "[SHADOW] Would deploy" : "Deployed";
-    log("entry", `${label} ${amountY} SOL → pool ${pool.pool_address.slice(0, 8)} mint ${mint.slice(0, 8)} (${binsBelow} bins below, ${signal.events.length}-wallet convergence)`);
-    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.pool_address.slice(0, 8)} (mint ${mint.slice(0, 8)}, ${signal.events.length} wallets)`);
+    log("entry", `${label} ${amountY} SOL → ${pool.name ?? pool.address.slice(0, 8)} [${tier}] ${screened.shape} (${screened.shapeReason}; ${binsBelow} bins below, bin step ${binStep}, vol ${pool.daily_vol_pct.toFixed(1)}%/day, fee/TVL ${pool.fee_tvl_ratio["24h"].toFixed(3)}%/day)`);
+    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.name ?? pool.address.slice(0, 8)} [${tier}] ${screened.shape}\n${screened.shapeReason} · fee/TVL ${pool.fee_tvl_ratio["24h"].toFixed(3)}%/day · vol ${pool.daily_vol_pct.toFixed(1)}%/day · ${binsBelow} bins${screened.jev ? `\nJev: ${screened.jev.decision} — ${screened.jev.reason}` : ""}`);
     return null;
   }
 
@@ -184,21 +215,17 @@ async function attemptEntry(signal) {
   return `deploy failed (${record.error})`;
 }
 
-// Immediate pre-entry conditions: the triggering wallets still hold their
-// exposure, the market has not run away since screening, and spendable funds
-// cover the entry. Returns null when everything holds, else the reason.
+// Immediate pre-entry conditions: the pool still passes its tier rules, the
+// market has not run away since screening, and spendable funds cover the
+// entry. Returns null when everything holds, else the reason.
 async function finalRecheck(signal, screened) {
-  let present = 0;
-  for (const e of signal.events) {
-    try { if (await exposureStillPresent(e)) present++; } catch { /* unreadable position = not confirmed */ }
-  }
-  if (present < config.standalone.walletThreshold) {
-    return `wallet exposure gone (${present}/${signal.events.length} remain)`;
-  }
   try {
-    const fresh = await poolDetail(screened.pool.pool_address);
-    const base = Number(screened.pool.pool_price);
-    const now = Number(fresh.pool_price);
+    const fresh = await getPool(screened.pool.address);
+    // Volatility comes from the screening candles; a minute later it cannot have moved.
+    const why = rejectPool(fresh, signal.mint, config.screening.tiers[screened.tier], config.screening, { volatility: false });
+    if (why) return `pool no longer qualifies: ${why}`;
+    const base = Number(screened.pool.current_price);
+    const now = Number(fresh.current_price);
     if (!(base > 0) || !(now > 0)) return "price unavailable for move check";
     const movePct = Math.abs(now - base) / base * 100;
     if (movePct > config.standalone.maxPriceMovePct) return `price moved ${movePct.toFixed(1)}% since screening`;
@@ -214,7 +241,7 @@ async function finalRecheck(signal, screened) {
 // ─── Exits (deterministic, no LLM) ──────────────────────────────────────────
 
 // One management pass: trailing/rule exits and fee claims. Never triggers
-// screening — an empty portfolio just waits for the next convergence signal.
+// screening — an empty portfolio just waits for the next scanner signal.
 export async function manageOnce() {
   if (manageBusy || shuttingDown) return null;
   manageBusy = true;
@@ -238,8 +265,12 @@ export async function manageOnce() {
       let action = null;
       if (closeRule?.action === "CLOSE") {
         action = { tool: "close_position", args: { position_address: p.position, reason: closeRule.reason }, label: `close (${closeRule.reason})` };
-      } else if ((p.unclaimed_fees_usd ?? 0) >= config.management.minClaimAmount) {
-        action = { tool: "claim_fees", args: { position_address: p.position }, label: "claim fees" };
+      } else {
+        const indicatorExit = await checkIndicatorExit(p);
+        if (indicatorExit) action = { tool: "close_position", args: { position_address: p.position, reason: indicatorExit }, label: `close (${indicatorExit})` };
+        else if ((p.unclaimed_fees_usd ?? 0) >= config.management.minClaimAmount) {
+          action = { tool: "claim_fees", args: { position_address: p.position }, label: "claim fees" };
+        }
       }
       // LLM-set free-text instructions have no execution path in standalone — hold.
       if (!action) continue;
@@ -251,6 +282,20 @@ export async function manageOnce() {
   } finally {
     manageBusy = false;
   }
+}
+
+// Indicator exit for the position's coin label, checked on the slow management pass
+// only. Candle reads are cached per pool for 10 minutes; unreadable data never exits.
+const indicatorCache = new Map();
+async function checkIndicatorExit(p) {
+  const exit = indicatorsFor(getTrackedPosition(p.position)?.label ?? null).exit;
+  if (exit === "none" || !p.pool) return null;
+  let hit = indicatorCache.get(p.pool);
+  if (!hit || Date.now() - hit.at > 10 * 60_000) {
+    try { hit = { at: Date.now(), snap: summarizeIndicators(await poolIndicators(p.pool)) }; indicatorCache.set(p.pool, hit); }
+    catch (e) { log("manage_warn", `${p.pair ?? p.position.slice(0, 8)}: indicator read failed (${e.message}) — holding`); return null; }
+  }
+  return INDICATOR_EXITS[exit](hit.snap.raw) ? `indicator exit ${exit} (${hit.snap.text})` : null;
 }
 
 // Fast exit poller (RPC + Meteora deposits, no LLM). An exit fires only after
@@ -293,13 +338,14 @@ function startPnlPoller() {
 
 // ─── Lifecycle ───────────────────────────────────────────────────────────────
 
+// DRY_RUN can be forced from .env without shadowMode; report what actually happens.
+const modeLabel = () => config.standalone.shadow ? "shadow" : process.env.DRY_RUN === "true" ? "dry-run" : "live";
+
 function startHeartbeat() {
   timers.heartbeat = setInterval(() => {
-    const stats = monitor?.stats ?? {};
     const active = Object.values(store.data.signals).filter(s => !s.done).length;
-    const pending = Object.keys(store.data.pending).length;
-    const lag = stats.lastLagMs != null ? `${(stats.lastLagMs / 1000).toFixed(1)}s` : "n/a";
-    log("heartbeat", `mode=${config.standalone.shadow ? "shadow" : "live"} | monitor tx=${stats.transactions ?? 0} entries=${stats.entries ?? 0} lag=${lag} pending=${pending} errors=${stats.errors ?? 0} | signals active=${active} queued=${signalQueue.length}`);
+    const last = scanStats.lastScanAt ? `${Math.round((Date.now() - scanStats.lastScanAt) / 60_000)}m ago` : "never";
+    log("heartbeat", `mode=${modeLabel()} | scanner scans=${scanStats.scans} last=${last} listed=${scanStats.listed} screened=${scanStats.candidates} emitted=${scanStats.emitted} errors=${scanStats.errors} | signals active=${active} queued=${signalQueue.length}`);
     store.prune();
     store.save();
   }, 60_000);
@@ -324,7 +370,7 @@ async function shutdown(signalName) {
   log("runtime", `${signalName} received — shutting down`);
   for (const timer of Object.values(timers)) clearInterval(timer);
   try { stopAdmin?.(); } catch { /* best-effort */ }
-  try { await monitor?.stop(); } catch { /* best-effort */ }
+  try { stopScanner?.(); } catch { /* best-effort */ }
   // Best-effort stop notice; never let a slow Telegram call hold shutdown.
   await Promise.race([notify(`🛑 Meridian stopped (${signalName})`), sleep(3000)]).catch(() => {});
   try { if (lockPath) fs.rmSync(lockPath, { force: true }); } catch { /* best-effort */ }
@@ -332,38 +378,39 @@ async function shutdown(signalName) {
 }
 
 export async function startStandalone() {
-  if (!config.standalone.monitorRpcUrl) throw new Error("Standalone requires RPC_URL or MONITOR_RPC_URL");
+  if (!config.standalone.rpcUrl) throw new Error("Standalone requires RPC_URL");
+  const problems = validateConfig();
+  if (problems.length) throw new Error(`Invalid configuration: ${problems.join("; ")}`);
   acquireLock();
 
   store = new MonitorStore();
+  const stale = finishStaleSignals(store, config.standalone);
+  if (stale) log("runtime", `Cleared ${stale} signal(s) left unfinished by the previous run`);
+  if (config.jev.mode === "approve" && !process.env.TYPESAFE_API_KEY) throw new Error("jevMode=approve requires TYPESAFE_API_KEY");
   for (const [mint, attempt] of Object.entries(store.data.attempts)) {
     if (attempt.status === "submitting") {
       log("runtime_warn", `Mint ${mint.slice(0, 8)} was mid-submit at shutdown (position ${attempt.position ?? "unknown"}, txs ${attempt.txs?.length ?? 0}) — reconcile on-chain before re-enabling entries`);
     }
   }
 
-  monitor = new WalletMonitor(store, config.standalone, { onSignal });
-  log("runtime", `Standalone starting — ${config.standalone.shadow ? "SHADOW MODE (proposals recorded, nothing submitted)" : "LIVE MODE"} | threshold=${config.standalone.walletThreshold} wallets / ${config.standalone.windowSec}s window | screening deadline=${config.standalone.screeningDeadlineSec}s`);
+  const tiers = config.screening.enabledTiers.join("+");
+  const modeText = { shadow: "SHADOW MODE (proposals recorded, nothing submitted)", "dry-run": "DRY RUN (nothing submitted)", live: "LIVE MODE" }[modeLabel()];
+  log("runtime", `Standalone starting — ${modeText} | tiers=${tiers} | scanner every ${config.scanner.scanMin}m${config.scanner.enabled ? "" : " (disabled — exits only)"} | screening deadline=${config.standalone.screeningDeadlineSec}s`);
 
-  await monitor.start();
-  if (!monitor.healthy()) {
-    log("runtime_warn", "Monitor baseline incomplete — wallets without a portfolio baseline produce no signals until reconciliation succeeds");
-  }
-
-  // Entries come only from signals; exits run on their own cadences.
+  // Entries come only from scanner signals; exits run on their own cadences.
+  if (config.scanner.enabled) stopScanner = startScanner({ store, onSignal, options: config.standalone });
   timers.manage = setInterval(() => { void manageOnce(); }, Math.max(1, config.schedule.managementIntervalMin) * 60_000);
   startPnlPoller();
   startHeartbeat();
   void manageOnce();
   stopAdmin = startAdmin({
-    monitor,
+    scanner: scanStats,
     activeSignals: () => Object.values(store.data.signals).filter(s => !s.done).length,
   });
 
-  const trackedWallets = Object.keys(store.data.wallets).length;
-  void notify(`🤖 Meridian started — ${config.standalone.shadow ? "SHADOW (nothing submitted)" : "LIVE"}\n${trackedWallets} wallet(s) monitored | trigger: ${config.standalone.walletThreshold} within ${config.standalone.windowSec}s | exits: ${config.pnl.pollIntervalSec}s poller`);
+  void notify(`🤖 Meridian started — ${modeLabel().toUpperCase()}\ntiers: ${tiers} | scanner every ${config.scanner.scanMin}m | exits: ${config.pnl.pollIntervalSec}s poller`);
 
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
-  log("runtime", `Running — exits every ${config.schedule.managementIntervalMin}m + ${config.pnl.pollIntervalSec}s poller; waiting for wallet convergence`);
+  log("runtime", `Running — exits every ${config.schedule.managementIntervalMin}m + ${config.pnl.pollIntervalSec}s poller; scanning Meteora pools`);
 }

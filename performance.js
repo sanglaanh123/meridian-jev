@@ -45,6 +45,23 @@ function buildSignalSnapshot(perf) {
   return Object.values(snapshot).some((value) => value != null) ? snapshot : null;
 }
 
+// Additive: signal source, tier and Jev answers stored on the entry attempt, for outcome correlation.
+function lookupAttempt(mint) {
+  if (!mint) return {};
+  try {
+    const attempt = JSON.parse(fs.readFileSync(repoPath("wallet-monitor-state.json"), "utf8")).attempts?.[mint];
+    if (!attempt) return {};
+    return {
+      ...(attempt.source ? { signal_source: attempt.source } : {}),
+      ...(attempt.tier ? { tier: attempt.tier } : {}),
+      ...(attempt.regime ? { regime: attempt.regime } : {}),
+      ...(attempt.label ? { label: attempt.label } : {}),
+      ...(attempt.indicators ? { indicators: attempt.indicators } : {}),
+      ...(attempt.jev ? { jev: { decision: attempt.jev.decision, ...attempt.jev.answers } } : {}),
+    };
+  } catch { return {}; }
+}
+
 export async function recordPerformance(perf) {
   const data = load();
 
@@ -86,6 +103,7 @@ export async function recordPerformance(perf) {
 
   const signalSnapshot = buildSignalSnapshot(perf);
   const entry = {
+    ...lookupAttempt(perf.base_mint),
     ...perf,
     signal_snapshot: signalSnapshot,
     pnl_usd: Math.round(pnl_usd * 100) / 100,

@@ -3,9 +3,8 @@ import {
   PublicKey,
   LAMPORTS_PER_SOL,
   VersionedTransaction,
-  Keypair,
 } from "@solana/web3.js";
-import bs58 from "bs58";
+import { parseSecretKey } from "../secret-key.js";
 import { rpcBalances, priceBalances } from "../standalone/balances.js";
 import { log } from "../logger.js";
 import { config } from "../config.js";
@@ -21,7 +20,7 @@ function getConnection() {
 function getWallet() {
   if (!_wallet) {
     if (!process.env.WALLET_PRIVATE_KEY) throw new Error("WALLET_PRIVATE_KEY not set");
-    _wallet = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY));
+    _wallet = parseSecretKey(process.env.WALLET_PRIVATE_KEY);
   }
   return _wallet;
 }
@@ -57,7 +56,10 @@ function getJupiterReferralParams() {
 export async function getWalletBalances(options = {}) {
   try {
     const walletAddress = config.standalone.walletAddress || getWallet().publicKey.toString();
-    const raw = await rpcBalances(walletAddress, options);
+    let raw = await rpcBalances(walletAddress, options);
+    // Dry run sizes and gates entries against a simulated SOL balance, like a funded live wallet.
+    const simulated = config.standalone.dryRunSolBalance;
+    if (process.env.DRY_RUN === "true" && simulated != null) raw = { ...raw, sol: simulated, simulated: true };
     return options.nativeOnly ? raw : await priceBalances(raw);
   } catch (error) {
     return { wallet: null, sol: null, sol_price: null, sol_usd: null, usdc: null, tokens: [], total_usd: null, error: error.message };

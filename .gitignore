@@ -9,6 +9,8 @@ node_modules/
 
 # User config (contains RPC URL, wallet key, API keys)
 user-config.json
+user-config.json.bak*
+coin-labels.json
 
 # GMGN fee-source config (contains API key)
 gmgn-config.json
@@ -52,3 +54,9 @@ discord-signals.json
 wallet-monitor-state.json
 wallet-monitor-state.json.tmp
 standalone.lock
+
+# Backtest data cache and reports
+.backtest-cache/
+
+# Local CodeGraph index
+.codegraph/

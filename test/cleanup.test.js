@@ -1,3 +1,4 @@
+import './setup-env.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -13,7 +14,7 @@ function sourceFiles(dir = REPO_ROOT) {
   });
 }
 function run(args) {
-  const env = { ...process.env, DRY_RUN: 'true' };
+  const env = { ...process.env, DRY_RUN: 'true' }; // MERIDIAN_LOG_DIR from setup-env keeps child logs out of logs/
   delete env.LLM_API_KEY; delete env.OPENROUTER_API_KEY; delete env.TELEGRAM_BOT_TOKEN;
   const result = spawnSync(process.execPath, args, { cwd: REPO_ROOT, env, encoding: 'utf8', timeout: 10_000 });
   assert.equal(result.error, undefined, result.error?.message);
@@ -33,6 +34,8 @@ test('standalone modules load without LLM credentials or network calls', () => {
     globalThis.fetch = () => { throw new Error('Unexpected network request during import'); };
     await import('./index.js');
     await import('./standalone/runtime.js');
+    await import('./standalone/scanner.js');
+    await import('./standalone/meteora.js');
     await import('./tools/executor.js');
     await import('./performance.js');
     console.log('loaded');
@@ -45,7 +48,8 @@ test('CLI advertises focused screening and rejects archived commands', () => {
   const help = run(['cli.js', 'help']);
   assert.equal(help.status, 0, help.stderr);
   assert.match(help.stdout, /screen --mint ADDRESS/);
-  for (const command of ['study','candidates','evolve','deploy']) {
+  assert.match(help.stdout, /\bscan\b/);
+  for (const command of ['study','candidates','evolve','deploy','wallets']) {
     const result = run(['cli.js', command]);
     assert.equal(result.status, 1);
     assert.match(result.stderr, /Unknown command/);
@@ -89,6 +93,11 @@ test('Meteora position mapping retains balances, fees, PnL, bins and missing-dat
   assert.equal(result.status, 0, result.stderr + result.stdout);
 });
 
+test('retired smart-wallet monitor stays removed', () => {
+  for (const file of ['smart-wallets.js', 'standalone/monitor.js', 'standalone/events.js']) assert.equal(fs.existsSync(path.join(REPO_ROOT, file)), false, file);
+  for (const file of sourceFiles()) assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /pool-discovery-api/, path.relative(REPO_ROOT, file));
+});
+
 test('active dependencies and configuration contain no retired agent integrations', async () => {
   const pkg=JSON.parse(fs.readFileSync(path.join(REPO_ROOT,'package.json'),'utf8'));
   for(const name of ['openai','jsonrepair','node-cron']) assert.equal(pkg.dependencies[name],undefined);
@@ -100,7 +109,7 @@ test('telegram admin menu schema is complete and every control renders', async (
   const {config} = await import('../config.js');
   const {_test} = await import('../standalone/telegram-admin.js');
   const {SECTIONS, byKey, editHint, validate, sectionMenu, fmtValue} = _test;
-  assert.deepEqual(SECTIONS.map(s => s.id), ['trigger', 'screening', 'risk', 'strategy', 'exits', 'rpc']);
+  assert.deepEqual(SECTIONS.map(s => s.id), ['scanner', 'screening', 'bluechip', 'midcap', 'risk', 'strategy', 'exits', 'rpc']);
   assert.ok(SECTIONS.some(s => s.id === 'strategy' && s.settings.some(x => x.k === 'strategy')), 'strategy shape must be configurable');
 
   for (const section of SECTIONS) {

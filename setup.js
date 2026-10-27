@@ -23,7 +23,7 @@ try {
   next.shadowMode = true;
   fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
   console.log('Saved user-config.json in shadow mode.');
-  console.log('Add LP wallets with: node cli.js wallets add --wallet ADDRESS --name NAME');
+  console.log('Tier thresholds (bluechip/midcap) are in user-config.json; preview entries with: node cli.js scan');
   console.log('Set WALLET_PRIVATE_KEY in your environment for live signing; no LLM or Helius Wallet API key is needed.');
   console.log('Review user-config.json, then run npm start.');
 } finally { rl.close(); }

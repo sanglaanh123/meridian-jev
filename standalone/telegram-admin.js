@@ -7,12 +7,11 @@
 // Authorization is enforced by startAdminPolling (TELEGRAM_ALLOWED_USER_IDS).
 
 import fs from "node:fs";
-import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
-import { config, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { parseSecretKey } from "../secret-key.js";
+import { config, MIN_SAFE_BINS_BELOW, TIER_DEFAULTS, tierKey } from "../config.js";
 import { log } from "../logger.js";
 import { repoPath } from "../repo-root.js";
-import { addSmartWallet, removeSmartWallet, listSmartWallets } from "../smart-wallets.js";
 import { sendMessage, sendMenu, editMenu, answerCallbackQuery, setBotCommands, startAdminPolling } from "../telegram.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
@@ -20,53 +19,59 @@ const ENV_PATH = repoPath(".env");
 
 export const ADMIN_COMMANDS = [
   { command: "menu", description: "Open the settings console" },
-  { command: "status", description: "Bot status, monitor stats, positions" },
-  { command: "wallets", description: "List monitored wallets" },
-  { command: "addwallet", description: "Add a monitored wallet: /addwallet <address> <name>" },
-  { command: "removewallet", description: "Remove a monitored wallet: /removewallet <address>" },
+  { command: "status", description: "Bot status, scanner stats, positions" },
   { command: "cancel", description: "Abort the current edit" },
 ];
 
 // ─── Settings schema ─────────────────────────────────────────────────────────
 // k: user-config key (or ENV: key for .env-backed entries)
 // path: live config object path; type drives validation + rendering.
+// Per-tier settings are generated from TIER_DEFAULTS so every tier field is editable.
+const TIER_FIELDS = {
+  minMcap: { type: "int", min: 0, max: 1e12, unit: "$" }, maxMcap: { type: "nullable", unit: "$" },
+  requiredTags: { type: "list" }, minHolders: { type: "int", min: 0, max: 10_000_000 },
+  minTokenAgeDays: { type: "int", min: 0, max: 3650, unit: "d" }, minOrganic: { type: "int", min: 0, max: 100 },
+  maxTop10Pct: { type: "float", min: 0, max: 100, unit: "%" }, minTvl: { type: "int", min: 0, max: 1e10, unit: "$" },
+  minVolume24h: { type: "int", min: 0, max: 1e10, unit: "$" }, minBinStep: { type: "int", min: 1, max: 500 },
+  maxBinStep: { type: "int", min: 1, max: 500 }, minFeeTvl24hPct: { type: "float", min: 0, max: 100, unit: "%" },
+  maxDailyVolPct: { type: "float", min: 0.1, max: 500, unit: "%" }, sizeMult: { type: "float", min: 0.05, max: 5, unit: "×" },
+  maxPositions: { type: "int", min: 0, max: 50 }, stopLossPct: { type: "float", min: -99, max: 0, unit: "%" },
+  rangeVolMult: { type: "float", min: 0.1, max: 20, unit: "×" }, allowedCategories: { type: "list" },
+};
+const tierSection = (tier, title) => ({
+  id: tier, title, desc: `${tier} tier: token, pool, sizing and stop overrides`,
+  settings: Object.keys(TIER_DEFAULTS[tier]).map(field => ({ k: tierKey(tier, field), path: ["screening", "tiers", tier, field], label: field, ...TIER_FIELDS[field] })),
+});
+
 const SECTIONS = [
   {
-    id: "trigger", title: "🚦 Trigger", desc: "Convergence detection",
+    id: "scanner", title: "📡 Scanner", desc: "Meteora pool scan → entry signals",
     settings: [
-      { k: "walletThreshold", path: ["standalone", "walletThreshold"], type: "int", min: 1, max: 10, unit: "wallets" },
-      { k: "walletWindowSec", path: ["standalone", "windowSec"], type: "int", min: 10, max: 3600, unit: "s" },
+      { k: "scannerEnabled", path: ["scanner", "enabled"], type: "bool", restart: true },
+      { k: "scanMin", path: ["scanner", "scanMin"], type: "int", min: 1, max: 1440, unit: "min", restart: true },
+      { k: "scanMaxCandidates", path: ["scanner", "maxCandidatesPerScan"], type: "int", min: 1, max: 20 },
+      { k: "scanMaxSignals", path: ["scanner", "maxSignalsPerScan"], type: "int", min: 1, max: 10 },
       { k: "screeningDeadlineSec", path: ["standalone", "screeningDeadlineSec"], type: "int", min: 10, max: 600, unit: "s" },
       { k: "screeningRetrySec", path: ["standalone", "retrySec"], type: "int", min: 3, max: 120, unit: "s" },
-      { k: "minSmartWalletDepositSol", path: ["standalone", "minDepositSol"], type: "float", min: 0, max: 1000, unit: "SOL" },
       { k: "maxEntryPriceMovePct", path: ["standalone", "maxPriceMovePct"], type: "float", min: 0.1, max: 100, unit: "%" },
-      { k: "walletSignalCooldownSec", path: ["standalone", "cooldownSec"], type: "int", min: 0, max: 86400, unit: "s" },
+      { k: "signalCooldownSec", path: ["standalone", "cooldownSec"], type: "int", min: 0, max: 604_800, unit: "s" },
     ],
   },
   {
-    id: "screening", title: "🛡 Screening", desc: "Token & pool filters (per triggered mint)",
+    id: "screening", title: "🛡 Screening", desc: "Shared filters, enabled tiers and Jev",
     settings: [
-      { k: "timeframe", path: ["screening", "timeframe"], type: "enum", options: ["5m", "30m", "1h", "2h", "4h", "12h", "24h"] },
-      { k: "minTvl", path: ["screening", "minTvl"], type: "int", min: 0, max: 10_000_000, unit: "$" },
-      { k: "maxTvl", path: ["screening", "maxTvl"], type: "int", min: 0, max: 100_000_000, unit: "$" },
-      { k: "minVolume", path: ["screening", "minVolume"], type: "int", min: 0, max: 10_000_000, unit: "$" },
-      { k: "minHolders", path: ["screening", "minHolders"], type: "int", min: 0, max: 100_000 },
-      { k: "minMcap", path: ["screening", "minMcap"], type: "int", min: 0, max: 100_000_000, unit: "$" },
-      { k: "maxMcap", path: ["screening", "maxMcap"], type: "int", min: 0, max: 1_000_000_000, unit: "$" },
-      { k: "minBinStep", path: ["screening", "minBinStep"], type: "int", min: 1, max: 5000 },
-      { k: "maxBinStep", path: ["screening", "maxBinStep"], type: "int", min: 1, max: 5000 },
-      { k: "minFeeActiveTvlRatio", path: ["screening", "minFeeActiveTvlRatio"], type: "float", min: 0, max: 10 },
-      { k: "minTokenFeesSol", path: ["screening", "minTokenFeesSol"], type: "float", min: 0, max: 10_000, unit: "SOL" },
-      { k: "maxTop10Pct", path: ["screening", "maxTop10Pct"], type: "float", min: 0, max: 100, unit: "%" },
-      { k: "maxBotHoldersPct", path: ["screening", "maxBotHoldersPct"], type: "float", min: 0, max: 100, unit: "%" },
-      { k: "minOrganic", path: ["screening", "minOrganic"], type: "int", min: 0, max: 100 },
-      { k: "minQuoteOrganic", path: ["screening", "minQuoteOrganic"], type: "int", min: 0, max: 100 },
-      { k: "minTokenAgeHours", path: ["screening", "minTokenAgeHours"], type: "nullable", unit: "h" },
-      { k: "maxTokenAgeHours", path: ["screening", "maxTokenAgeHours"], type: "nullable", unit: "h" },
-      { k: "allowedLaunchpads", path: ["screening", "allowedLaunchpads"], type: "list" },
-      { k: "blockedLaunchpads", path: ["screening", "blockedLaunchpads"], type: "list" },
+      { k: "enabledTiers", path: ["screening", "enabledTiers"], type: "list" },
+      { k: "requireRenouncedAuthorities", path: ["screening", "requireRenouncedAuthorities"], type: "bool" },
+      { k: "minPoolAgeHours", path: ["screening", "minPoolAgeHours"], type: "int", min: 0, max: 8760, unit: "h" },
+      { k: "feeStabilityMin", path: ["screening", "feeStabilityMin"], type: "float", min: 0, max: 100, unit: "×" },
+      { k: "feeStabilityMax", path: ["screening", "feeStabilityMax"], type: "float", min: 0, max: 100, unit: "×" },
+      { k: "jevMode", path: ["jev", "mode"], type: "enum", options: ["off", "shadow", "veto", "approve"], label: "jev mode" },
+      { k: "jevMinEstablished", path: ["jev", "minEstablished"], type: "float", min: 0, max: 1 },
+      { k: "jevRiskMax", path: ["jev", "riskMax"], type: "float", min: 0, max: 1 },
     ],
   },
+  tierSection("bluechip", "💎 Bluechip tier"),
+  tierSection("midcap", "🔷 Midcap tier"),
   {
     id: "risk", title: "📏 Risk & sizing", desc: "Portfolio limits and deploy size",
     settings: [
@@ -76,12 +81,14 @@ const SECTIONS = [
       { k: "positionSizePct", path: ["management", "positionSizePct"], type: "float", min: 0.01, max: 1, unit: "fraction" },
       { k: "gasReserve", path: ["management", "gasReserve"], type: "float", min: 0, max: 10, unit: "SOL" },
       { k: "minSolToOpen", path: ["management", "minSolToOpen"], type: "float", min: 0, max: 100, unit: "SOL" },
+      { k: "dryRunSolBalance", path: ["standalone", "dryRunSolBalance"], type: "nullable", unit: "SOL", label: "dry-run SOL" },
     ],
   },
   {
     id: "strategy", title: "📐 Strategy", desc: "Position shape & bin range",
     settings: [
-      { k: "strategy", path: ["strategy", "strategy"], type: "enum", options: ["spot", "curve", "bid_ask"], label: "shape" },
+      { k: "strategy", path: ["strategy", "strategy"], type: "enum", options: ["auto", "spot", "curve", "bid_ask"], label: "shape" },
+      { k: "regimeFallbackStrategy", path: ["strategy", "regimeFallback"], type: "enum", options: ["spot", "curve", "bid_ask"], label: "auto fallback" },
       { k: "minBinsBelow", path: ["strategy", "minBinsBelow"], type: "int", min: MIN_SAFE_BINS_BELOW, max: 200, unit: "bins" },
       { k: "maxBinsBelow", path: ["strategy", "maxBinsBelow"], type: "int", min: MIN_SAFE_BINS_BELOW, max: 200, unit: "bins" },
       { k: "defaultBinsBelow", path: ["strategy", "defaultBinsBelow"], type: "int", min: MIN_SAFE_BINS_BELOW, max: 200, unit: "bins" },
@@ -91,7 +98,9 @@ const SECTIONS = [
     id: "exits", title: "🚪 Exits", desc: "Deterministic close rules",
     settings: [
       { k: "stopLossPct", path: ["management", "stopLossPct"], type: "float", min: -99, max: 0, unit: "%" },
-      { k: "takeProfitPct", path: ["management", "takeProfitPct"], type: "float", min: 0, max: 1000, unit: "%" },
+      { k: "takeProfitPct", path: ["management", "takeProfitPct"], type: "nullable", unit: "%" },
+      { k: "minAgeBeforeYieldCheck", path: ["management", "minAgeBeforeYieldCheck"], type: "int", min: 0, max: 10_000, unit: "min" },
+      { k: "autoSwapAfterClaim", path: ["management", "autoSwapAfterClaim"], type: "bool" },
       { k: "trailingTakeProfit", path: ["management", "trailingTakeProfit"], type: "bool" },
       { k: "trailingTriggerPct", path: ["management", "trailingTriggerPct"], type: "float", min: 0.1, max: 1000, unit: "%" },
       { k: "trailingDropPct", path: ["management", "trailingDropPct"], type: "float", min: 0.1, max: 100, unit: "%" },
@@ -111,8 +120,6 @@ const SECTIONS = [
     id: "rpc", title: "🌐 RPC & data", desc: "Endpoints (.env) — restart to apply",
     settings: [
       { k: "ENV:RPC_URL", label: "RPC_URL (default)", type: "env", kind: "url", restart: true },
-      { k: "ENV:MONITOR_RPC_URL", label: "MONITOR_RPC_URL", type: "env", kind: "url", restart: true },
-      { k: "ENV:MONITOR_WS_URL", label: "MONITOR_WS_URL", type: "env", kind: "url", restart: true },
       { k: "ENV:BALANCE_RPC_URL", label: "BALANCE_RPC_URL", type: "env", kind: "url", restart: true },
       { k: "ENV:FALLBACK_RPC_URL", label: "FALLBACK_RPC_URL", type: "env", kind: "url", restart: true },
       { k: "ENV:PNL_RPC_URL", label: "PNL_RPC_URL", type: "env", kind: "url", restart: true },
@@ -245,7 +252,7 @@ function fmtValue(setting) {
 function rootKeyboard() {
   const mode = `🌑 Shadow: ${config.standalone.shadow ? "ON" : "OFF"}`;
   return [
-    [{ text: "👛 Wallets", callback_data: "s:wallets" }, { text: "🖥 Status", callback_data: "s:status" }],
+    [{ text: "🖥 Status", callback_data: "s:status" }],
     ...SECTIONS.map(s => [{ text: s.title, callback_data: `s:${s.id}` }]),
     [{ text: "🔑 Bot key", callback_data: "s:key" }, { text: mode, callback_data: "m:shadow" }],
     [{ text: "♻️ Restart bot", callback_data: "m:restart" }],
@@ -277,8 +284,8 @@ function sectionMenu(section) {
   }]);
   const explainers = {
     strategy:
-      "Range: bins below the active bin scale with pool volatility, clamped to min–max (bins above = 0). " +
-      "Shape: spot = flat, curve = bell, bid_ask = concentrated at the center. Applied per entry, no restart.",
+      "Range: bins below the active bin cover the tier's rangeVolMult × daily volatility at the pool's bin step, clamped to min–max (bins above = 0). " +
+      "Shape: spot = flat, curve = concentrated near the price, bid_ask = concentrated at the far edge; auto picks per entry from the pool regime (trend/volatility) using regimeStrategies in user-config.json. Applied per entry, no restart.",
     rpc: "Endpoints live in .env — edit, then ♻️ Restart.",
   };
   return {
@@ -297,14 +304,6 @@ async function viewRoot() {
 }
 
 async function viewSection(sectionId, note = "") {
-  if (sectionId === "wallets") {
-    const { wallets } = listSmartWallets();
-    const rows = wallets.map((w, i) => [{ text: `🗑 ${w.name}`, callback_data: `w:rm:${i}` }]);
-    return void await render(
-      `👛 <b>Monitored wallets</b> (${wallets.length})\n${wallets.map(w => `• <b>${w.name}</b>\n<code>${w.address}</code>`).join("\n") || "none — add at least 2 to trigger entries"}${note ? `\n\n${note}` : ""}`,
-      [...rows, [{ text: "➕ Add wallet", callback_data: "w:add" }, { text: "← Back", callback_data: "s:root" }]],
-    );
-  }
   if (sectionId === "key") {
     let deposit = config.standalone.walletAddress || null;
     let keyState = "not set";
@@ -319,7 +318,7 @@ async function viewSection(sectionId, note = "") {
       try {
         const { getWalletBalances } = await import("../tools/wallet.js");
         const b = await getWalletBalances({ nativeOnly: true });
-        if (!b.error && Number.isFinite(b.sol)) balanceLine = `\nSOL balance: <b>${b.sol.toFixed(4)}</b>`;
+        if (!b.error && Number.isFinite(b.sol)) balanceLine = `\nSOL balance: <b>${b.sol.toFixed(4)}</b>${b.simulated ? " (dry-run simulated)" : ""}`;
       } catch { /* balance is best-effort */ }
     }
     return void await render(
@@ -343,18 +342,16 @@ async function viewSection(sectionId, note = "") {
 const hostOf = url => { try { return new URL(url).host; } catch { return "?"; } };
 
 async function statusText() {
-  const stats = adminContext.monitor?.stats ?? {};
-  const wallets = listSmartWallets();
-  const monitorUrl = config.standalone.monitorRpcUrl || envValue("RPC_URL");
+  const stats = adminContext.scanner ?? {};
+  const mainUrl = config.standalone.rpcUrl || envValue("RPC_URL");
   const balanceUrl = config.standalone.balanceRpcUrl || envValue("RPC_URL");
   const fallbackUrl = config.standalone.fallbackRpcUrl;
   const lines = [
     `🖥 <b>Status</b>`,
-    `Mode: ${config.standalone.shadow ? "🌑 SHADOW" : "🔴 LIVE"} | DRY_RUN=${process.env.DRY_RUN === "true"}`,
+    `Mode: ${config.standalone.shadow ? "🌑 SHADOW" : process.env.DRY_RUN === "true" ? "🧪 DRY RUN" : "🔴 LIVE"} | tiers: ${config.screening.enabledTiers.join("+")}`,
     `Uptime: ${Math.floor(process.uptime() / 60)} min`,
-    `Wallets monitored: ${wallets.total} (trigger: ${config.standalone.walletThreshold} in ${config.standalone.windowSec}s)`,
-    `RPC: monitor=${hostOf(monitorUrl)} balance=${hostOf(balanceUrl)}${fallbackUrl ? ` fallback=${hostOf(fallbackUrl)}` : ""}`,
-    `Monitor: tx=${stats.transactions ?? 0} entries=${stats.entries ?? 0} lag=${stats.lastLagMs != null ? `${(stats.lastLagMs / 1000).toFixed(1)}s` : "n/a"} errors=${stats.errors ?? 0}`,
+    `RPC: main=${hostOf(mainUrl)} balance=${hostOf(balanceUrl)}${fallbackUrl ? ` fallback=${hostOf(fallbackUrl)}` : ""}`,
+    `Scanner: every ${config.scanner.scanMin}m${config.scanner.enabled ? "" : " (disabled)"} | scans=${stats.scans ?? 0} last=${stats.lastScanAt ? `${Math.round((Date.now() - stats.lastScanAt) / 60_000)}m ago` : "never"} screened=${stats.candidates ?? 0} signals=${stats.emitted ?? 0} errors=${stats.errors ?? 0}`,
     `Signals active: ${adminContext.activeSignals?.() ?? 0}`,
   ];
   try {
@@ -363,18 +360,6 @@ async function statusText() {
     lines.push(`Positions: ${positions.total_positions}${positions.positions.length ? ` (${positions.positions.map(p => `${p.pair ?? "?"} ${p.pnl_pct ?? "?"}%`).join(", ")})` : ""}`);
   } catch { lines.push("Positions: unavailable"); }
   return lines.join("\n");
-}
-
-function parseSecretKey(raw) {
-  const text = String(raw).trim();
-  if (text.startsWith("[")) {
-    const bytes = JSON.parse(text);
-    if (!Array.isArray(bytes) || bytes.length !== 64 || bytes.some(n => !Number.isInteger(n) || n < 0 || n > 255)) throw new Error("bad array");
-    return Keypair.fromSecretKey(Uint8Array.from(bytes));
-  }
-  const bytes = bs58.decode(text);
-  if (bytes.length !== 64) throw new Error("bad length");
-  return Keypair.fromSecretKey(bytes);
 }
 
 function requestRestart() {
@@ -387,7 +372,7 @@ function requestRestart() {
 
 // ─── Callbacks ───────────────────────────────────────────────────────────────
 
-let pending = null; // { kind, setting?|address? }
+let pending = null; // { kind, setting? }
 
 async function handleCallback(cb) {
   const data = cb.data || "";
@@ -409,25 +394,6 @@ async function handleCallback(cb) {
       if (!setting) return;
       pending = { kind: "set", setting };
       return void await render(`✏️ <b>${setting.label ?? setting.k}</b>\nCurrent: <code>${fmtValue(setting)}</code>\n\n${editHint(setting)}`, cancelKB());
-    }
-    if (data === "w:add") {
-      pending = { kind: "waddr" };
-      return void await render("👛 Send the wallet <b>address</b>:", cancelKB());
-    }
-    if (data.startsWith("w:rm2:")) {
-      const { wallets } = listSmartWallets();
-      const w = wallets[Number(data.slice(6))];
-      if (!w) return void await viewSection("wallets", "⚠️ Wallet not found.");
-      const res = removeSmartWallet({ address: w.address });
-      return void await viewSection("wallets", res.success ? `🗑 Removed ${w.name}` : `⚠️ ${res.error}`);
-    }
-    if (data.startsWith("w:rm:")) {
-      const { wallets } = listSmartWallets();
-      const w = wallets[Number(data.slice(5))];
-      if (!w) return void await viewSection("wallets", "⚠️ Wallet not found.");
-      return void await render(`Remove <b>${w.name}</b>\n<code>${w.address}</code>?`, [
-        [{ text: "🗑 Confirm remove", callback_data: `w:rm2:${data.slice(5)}` }, { text: "✖️ Cancel", callback_data: "s:wallets" }],
-      ]);
     }
     if (data === "k:imp") {
       pending = { kind: "pkimport" };
@@ -490,19 +456,6 @@ async function handleText(text) {
         const sectionId = SECTIONS.find(s => s.settings.includes(p.setting))?.id;
         return void await viewSection(sectionId, `✅ <b>${p.setting.label ?? p.setting.k}</b> → <code>${fmtValue(p.setting)}</code>${needs ? "\n♻️ Applies after restart" : ""}`);
       }
-      if (p.kind === "waddr") {
-        if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text.trim())) {
-          pending = { kind: "waddr" };
-          return void await render("⚠️ Not a valid Solana address — send it again, or tap Cancel:", cancelKB());
-        }
-        pending = { kind: "wname", address: text.trim() };
-        return void await render("Name this wallet:", cancelKB());
-      }
-      if (p.kind === "wname") {
-        const name = text.trim().slice(0, 40) || "wallet";
-        const res = addSmartWallet({ address: p.address, name });
-        return void await viewSection("wallets", res.success ? `✅ Added <b>${name}</b>\n<code>${p.address}</code>` : `⚠️ ${res.error}`);
-      }
       if (p.kind === "pkimport") {
         const kp = parseSecretKey(text);
         writeEnvValue("WALLET_PRIVATE_KEY", bs58.encode(kp.secretKey));
@@ -528,31 +481,20 @@ async function handleText(text) {
       consoleMessageId = null;
       lastRenderSig = null;
     }
-    return void await viewRoot("Commands: /addwallet <address> <name> · /removewallet <address> · /wallets · /status · /cancel");
+    return void await viewRoot("Commands: /menu · /status · /cancel");
   }
   if (cmd === "/status") return void await viewSection("status");
-  if (cmd === "/wallets") return void await viewSection("wallets");
-  if (cmd === "/addwallet") {
-    const address = args[0];
-    const name = args.slice(1).join(" ").slice(0, 40) || "wallet";
-    const res = addSmartWallet({ address: address ?? "", name });
-    return void await viewSection("wallets", res.success ? `✅ Added <b>${name}</b> <code>${address}</code>` : `⚠️ ${res.error}`);
-  }
-  if (cmd === "/removewallet") {
-    const res = removeSmartWallet({ address: args[0] ?? "" });
-    return void await viewSection("wallets", res.success ? `🗑 Removed ${res.removed}` : `⚠️ ${res.error}`);
-  }
 }
 
 // ─── Wiring ──────────────────────────────────────────────────────────────────
 
-const adminContext = { monitor: null, activeSignals: null };
+const adminContext = { scanner: null, activeSignals: null };
 
 // Exposed for the menu-schema tests in test/cleanup.test.js.
 export const _test = { SECTIONS, byKey, editHint, validate, sectionMenu, fmtValue };
 
-export function startAdmin({ monitor = null, activeSignals = null } = {}) {
-  adminContext.monitor = monitor;
+export function startAdmin({ scanner = null, activeSignals = null } = {}) {
+  adminContext.scanner = scanner;
   adminContext.activeSignals = activeSignals;
   const stop = startAdminPolling(async ({ message, callback }) => {
     if (callback) await handleCallback(callback);

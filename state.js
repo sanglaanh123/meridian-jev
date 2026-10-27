@@ -10,6 +10,7 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { config } from "./config.js";
 import { repoPath } from "./repo-root.js";
 
 const STATE_FILE = repoPath("state.json");
@@ -73,6 +74,10 @@ export function trackPosition({
   entry_tvl = null,
   entry_volume = null,
   entry_holders = null,
+  tier = null,
+  label = null,
+  stop_loss_pct,
+  oor_wait_minutes = null,
 }) {
   const state = load();
   state.positions[position] = {
@@ -94,6 +99,11 @@ export function trackPosition({
     entry_tvl,
     entry_volume,
     entry_holders,
+    tier,
+    label,
+    // Per-position exit overrides (tuned regime entries); undefined/null = tier/global value.
+    ...(stop_loss_pct !== undefined ? { stop_loss_pct } : {}),
+    oor_wait_minutes,
     signal_snapshot: signal_snapshot || null,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
@@ -385,10 +395,12 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   if (changed) save(state);
 
   // ── Stop loss ──────────────────────────────────────────────────
-  if (!pnl_pct_suspicious && currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
+  // The tier recorded at entry may tighten the stop; the global value is the fallback.
+  const stopLossPct = "stop_loss_pct" in pos ? pos.stop_loss_pct : config.screening.tiers[pos.tier]?.stopLossPct ?? mgmtConfig.stopLossPct;
+  if (!pnl_pct_suspicious && currentPnlPct != null && stopLossPct != null && currentPnlPct <= stopLossPct) {
     return {
       action: "STOP_LOSS",
-      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}%`,
+      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${stopLossPct}%`,
     };
   }
 
@@ -410,10 +422,11 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Out of range too long ──────────────────────────────────────
   if (pos.out_of_range_since) {
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
-    if (minutesOOR >= mgmtConfig.outOfRangeWaitMinutes) {
+    const oorWait = pos.oor_wait_minutes ?? mgmtConfig.outOfRangeWaitMinutes;
+    if (minutesOOR >= oorWait) {
       return {
         action: "OUT_OF_RANGE",
-        reason: `Out of range for ${minutesOOR}m (limit: ${mgmtConfig.outOfRangeWaitMinutes}m)`,
+        reason: `Out of range for ${minutesOOR}m (limit: ${oorWait}m)`,
       };
     }
   }

@@ -1,5 +1,7 @@
 import fs from "fs";
 import { REPO_ROOT, repoPath } from "./repo-root.js";
+import { LABELS, loadCoinLabels } from "./standalone/labels.js";
+import { INDICATOR_GATES, INDICATOR_EXITS } from "./standalone/indicators.js";
 
 export { REPO_ROOT, repoPath };
 
@@ -42,65 +44,121 @@ function nonEmptyString(...values) {
   return null;
 }
 
+// Per-tier screening, sizing and exit overrides. Flat user-config keys
+// (e.g. midcapMinTvl) keep the Telegram editor and user-config.json simple.
+export const TIER_DEFAULTS = {
+  bluechip: {
+    minMcap: 500_000_000, maxMcap: null, requiredTags: ["strict", "verified"],
+    minHolders: 10_000, minTokenAgeDays: 30, minOrganic: 60, maxTop10Pct: 70,
+    minTvl: 200_000, minVolume24h: 100_000, minBinStep: 1, maxBinStep: 100,
+    minFeeTvl24hPct: 0.03, maxDailyVolPct: 12,
+    sizeMult: 1, maxPositions: 3, stopLossPct: -15, rangeVolMult: 2,
+    allowedCategories: ["lst", "major_defi", "infrastructure", "wrapped_asset", "established_meme"],
+  },
+  midcap: {
+    minMcap: 20_000_000, maxMcap: 500_000_000, requiredTags: ["verified"],
+    minHolders: 5_000, minTokenAgeDays: 14, minOrganic: 70, maxTop10Pct: 50,
+    minTvl: 75_000, minVolume24h: 50_000, minBinStep: 10, maxBinStep: 200,
+    minFeeTvl24hPct: 0.1, maxDailyVolPct: 25,
+    sizeMult: 0.5, maxPositions: 2, stopLossPct: -10, rangeVolMult: 2.5,
+    allowedCategories: ["lst", "major_defi", "infrastructure", "wrapped_asset", "established_meme"],
+  },
+};
+export const SHAPES = ["spot", "curve", "bid_ask"];
+export const DEFAULT_REGIME_STRATEGIES = {
+  "down/low": "bid_ask", "down/mid": "bid_ask", "down/high": "bid_ask",
+  "range/low": "bid_ask", "range/mid": "bid_ask", "range/high": "skip",
+  "up/low": "bid_ask", "up/mid": "skip", "up/high": "skip",
+};
+// Strategy per coin label (see standalone/labels.js). Calm groups farm a wide bid_ask
+// ladder with a stop (scripts/tune.js on low-volatility coins); volatile groups follow
+// the regime map; LSTs earn ~0 fees on SOL pairs, so skip them.
+const CALM_ENTRY = { shape: "bid_ask", rangeVolMult: 4, stopLossPct: -10, outOfRangeWaitMinutes: 240 };
+export const DEFAULT_LABEL_STRATEGIES = {
+  lst: "skip", wrapped: CALM_ENTRY, defi_bluechip: CALM_ENTRY, calm: CALM_ENTRY, volatile: "regime", meme: "regime",
+};
+// Pool rule per label, chosen on the fit period by scripts/binstep-lab.js (60d): on the
+// later test period each beat "highest fee/TVL" (fee24), except meme where it is fee24.
+export const DEFAULT_LABEL_POOL_RULES = {
+  lst: "tvl", wrapped: "tvl", defi_bluechip: "tvl", calm: "largest", volatile: "fit", meme: "fee24",
+};
+// Indicator gate/exit per label, picked by scripts/indicator-lab.js (60d, validate → test):
+// calm groups: enter only in 4h ER chop with 4h structure not down, exit on a 1h ATR-ZLEMA
+// down-flip (test −0.40 → −0.11 %/72h); volatile groups: enter only with 1h ADX < 20, exit
+// on a 4h ZLEMA down-flip (test −0.66 → −0.08). Both still slightly negative.
+const CALM_INDICATORS = { gate: "er4_chop_and_struct", exit: "zl1_down" };
+const VOLATILE_INDICATORS = { gate: "adx1_low", exit: "zl4_down" };
+export const DEFAULT_LABEL_INDICATORS = {
+  lst: { gate: "none", exit: "none" }, wrapped: CALM_INDICATORS, defi_bluechip: CALM_INDICATORS, calm: CALM_INDICATORS,
+  volatile: VOLATILE_INDICATORS, meme: VOLATILE_INDICATORS,
+};
+export const tierKey = (tier, field) => `${tier}${field[0].toUpperCase()}${field.slice(1)}`;
+const tiers = Object.fromEntries(Object.entries(TIER_DEFAULTS).map(([tier, defaults]) => [
+  tier,
+  Object.fromEntries(Object.entries(defaults).map(([field, value]) => [field, u[tierKey(tier, field)] ?? value])),
+]));
+
 export const config = {
-  // The standalone wallet-triggered bot IS the app — there is no mode toggle.
-  // The LLM/server-driven flow lives on the `legacy` branch.
-  // Shadow mode never submits transactions.
+  // Bluechip + mid-cap DLMM farmer. Entries come only from the Meteora pool
+  // scanner; there is no mode toggle. Shadow mode never submits transactions.
   standalone: {
     shadow: u.shadowMode !== false,
-    monitorRpcUrl: nonEmptyString(process.env.MONITOR_RPC_URL, u.monitorRpcUrl, process.env.RPC_URL),
-    monitorWsUrl: nonEmptyString(process.env.MONITOR_WS_URL, u.monitorWsUrl),
+    rpcUrl: nonEmptyString(process.env.RPC_URL, u.rpcUrl),
     balanceRpcUrl: nonEmptyString(process.env.BALANCE_RPC_URL, u.balanceRpcUrl, process.env.RPC_URL),
     fallbackRpcUrl: nonEmptyString(process.env.FALLBACK_RPC_URL, u.fallbackRpcUrl),
     walletAddress: nonEmptyString(process.env.WALLET_ADDRESS, u.walletAddress),
-    walletThreshold: u.walletThreshold ?? 2,
-    windowSec: u.walletWindowSec ?? 120,
     screeningDeadlineSec: u.screeningDeadlineSec ?? 120,
     retrySec: u.screeningRetrySec ?? 15,
-    reconcileSec: u.walletReconcileSec ?? 30,
-    minDepositSol: u.minSmartWalletDepositSol ?? 0.1,
-    maxPriceMovePct: u.maxEntryPriceMovePct ?? 5,
-    cooldownSec: u.walletSignalCooldownSec ?? 300,
-    maxPendingTransactions: u.maxPendingWalletTransactions ?? 1000,
-    walletGroups: u.walletGroups ?? {},
+    maxPriceMovePct: u.maxEntryPriceMovePct ?? 3,
+    // A screened-out or entered mint is not re-signalled before this cooldown.
+    cooldownSec: u.signalCooldownSec ?? 3600,
+    // Simulated native SOL used for sizing and fund gates while DRY_RUN is on; null = real balance.
+    dryRunSolBalance: u.dryRunSolBalance == null || numericConfig(u.dryRunSolBalance) < 0 ? null : numericConfig(u.dryRunSolBalance),
   },
+
+  // ─── Meteora pool scanner (the only entry trigger) ───
+  scanner: {
+    enabled:              u.scannerEnabled              ?? true,
+    scanMin:              u.scanMin                     ?? 15,
+    maxCandidatesPerScan: u.scanMaxCandidates           ?? 5,
+    maxSignalsPerScan:    u.scanMaxSignals              ?? 1,
+  },
+
   // ─── Risk Limits ─────────────────────────
   risk: {
-    maxPositions:    u.maxPositions    ?? 3,
+    maxPositions:    u.maxPositions    ?? 4,
     maxDeployAmount: u.maxDeployAmount ?? 50,
   },
 
-  // ─── Pool Screening Thresholds ───────────
+  // ─── Pool Screening (tiered: bluechip + midcap) ───
   screening: {
-    minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
-    minTvl:            u.minTvl            ?? 10_000,
-    maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
-    minVolume:         u.minVolume         ?? 500,
-    minOrganic:        u.minOrganic        ?? 60,
-    minQuoteOrganic:   u.minQuoteOrganic   ?? 60,
-    minHolders:        u.minHolders        ?? 500,
-    minMcap:           u.minMcap           ?? 150_000,
-    maxMcap:           u.maxMcap           ?? 10_000_000,
-    minBinStep:        u.minBinStep        ?? 80,
-    maxBinStep:        u.maxBinStep        ?? 125,
-    timeframe:         u.timeframe         ?? "5m",
-    minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
-    maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
-    maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
-    allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
-    blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
-    minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
-    maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
+    enabledTiers:                u.enabledTiers                ?? ["bluechip", "midcap"],
+    tiers,
+    requireRenouncedAuthorities: u.requireRenouncedAuthorities ?? true,
+    minPoolAgeHours:             u.minPoolAgeHours             ?? 24,
+    feeStabilityMin:             u.feeStabilityMin             ?? 0.3,  // fee/TVL 4h×6 vs 24h band
+    feeStabilityMax:             u.feeStabilityMax             ?? 3,
+  },
+
+  // ─── Jev (TypeSafe) bluechip classifier; key from TYPESAFE_API_KEY env only ───
+  jev: {
+    mode:           u.jevMode           ?? "off",   // off | shadow | veto | approve
+    model:          u.jevModel          ?? "jev-latest",
+    riskMax:        u.jevRiskMax        ?? 0.7,     // impersonation at/above this rejects
+    minEstablished: u.jevMinEstablished ?? 0.7,     // "established project" needed to approve
+    minConfidence:  u.jevMinConfidence  ?? 0.6,     // category confidence needed to reject on category
+    timeoutMs:      u.jevTimeoutMs      ?? 8000,
+    cacheMin:       u.jevCacheMin       ?? 30,
   },
 
   // ─── Position Management ────────────────
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
-    autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
+    autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? true,  // compound claimed fees back into SOL
     autoSwapRetryAttempts: u.autoSwapRetryAttempts ?? 3,    // retries for base→SOL auto-swap on Jupiter failure
     autoSwapRetryDelayMs:  u.autoSwapRetryDelayMs  ?? 3000, // delay between auto-swap retries
-    outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
-    outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
+    outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 30,
+    outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 120,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,
@@ -108,16 +166,16 @@ export const config = {
     repeatDeployCooldownHours: u.repeatDeployCooldownHours ?? 12,
     repeatDeployCooldownScope: u.repeatDeployCooldownScope ?? "token", // pool | token | both
     repeatDeployCooldownMinFeeEarnedPct: u.repeatDeployCooldownMinFeeEarnedPct ?? u.repeatDeployCooldownMinFeeYieldPct ?? 0,
-    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
-    takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
-    minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
-    minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
+    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -15, // fallback when the tier has none
+    takeProfitPct:         u.takeProfitPct !== undefined ? u.takeProfitPct : null,  // null = off (long farming)
+    minFeePerTvl24h:       u.minFeePerTvl24h       ?? 0.02,  // % per day, same scale as pool fee_tvl_ratio
+    minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 360, // minutes before low yield can trigger close
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
     // Trailing take-profit
-    trailingTakeProfit:    u.trailingTakeProfit    ?? true,
+    trailingTakeProfit:    u.trailingTakeProfit    ?? false,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
@@ -127,7 +185,29 @@ export const config = {
 
   // ─── Strategy Mapping ───────────────────
   strategy: {
-    strategy:     u.strategy     ?? "bid_ask",
+    // "auto" picks the shape per entry from the pool's regime (standalone/regime.js).
+    strategy:     u.strategy     ?? "auto",
+    // regime key "<trend>/<vol>" → spot | curve | bid_ask | skip. Defaults come from
+    // `node scripts/strategy-lab.js` (60d, one-sided SOL): bid_ask lost least in every
+    // regime; range/high, up/mid and up/high lost >1% per 72h even then, so skip them.
+    regimeStrategies: { ...DEFAULT_REGIME_STRATEGIES, ...(u.regimeStrategies ?? {}) },
+    regimeFallback: u.regimeFallbackStrategy ?? "bid_ask",  // when candles are too short to classify
+    // Coin labels (coin-labels.json) pick a group strategy under "auto"; see pickShape.
+    labelStrategies: { ...DEFAULT_LABEL_STRATEGIES, ...(u.labelStrategies ?? {}) },
+    unlabeledStrategy: u.unlabeledStrategy ?? "regime",   // "skip" = trade labeled coins only
+    // Which of a coin's SOL pools (bin steps) to farm, per label: fee24 | tvl | fit | largest | smallest.
+    labelPoolRules: { ...DEFAULT_LABEL_POOL_RULES, ...(u.labelPoolRules ?? {}) },
+    unlabeledPoolRule: u.unlabeledPoolRule ?? "fee24",
+    // Indicator entry gate / exit per label ({ gate, exit } names in standalone/indicators.js).
+    labelIndicators: Object.fromEntries(Object.entries(DEFAULT_LABEL_INDICATORS).map(([label, d]) => [label, { ...d, ...(u.labelIndicators?.[label] ?? {}) }])),
+    unlabeledIndicators: { gate: "none", exit: "none", ...(u.unlabeledIndicators ?? {}) },
+    coinLabels: loadCoinLabels(),
+    // up/down needs |72h move| > trendPct with the 24h move agreeing; vol buckets by daily realized vol %.
+    regimeThresholds: {
+      trendPct: u.regimeTrendPct ?? 5,
+      lowVol:   u.regimeLowVolPct ?? 5,
+      highVol:  u.regimeHighVolPct ?? 12,
+    },
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
@@ -173,6 +253,55 @@ export const config = {
   },
 
 };
+
+/** Startup validation for values whose typos would otherwise silently disable a gate. */
+export function validateConfig() {
+  const problems = [];
+  if (!["off", "shadow", "veto", "approve"].includes(config.jev.mode)) problems.push(`jevMode "${config.jev.mode}" — use off, shadow, veto or approve`);
+  if (!Array.isArray(config.screening.enabledTiers) || !config.screening.enabledTiers.length) problems.push("enabledTiers must list at least one tier");
+  if (![...SHAPES, "auto"].includes(config.strategy.strategy)) problems.push(`strategy "${config.strategy.strategy}" — use auto, ${SHAPES.join(", ")}`);
+  if (!SHAPES.includes(config.strategy.regimeFallback)) problems.push(`regimeFallbackStrategy "${config.strategy.regimeFallback}" — use ${SHAPES.join(", ")}`);
+  const checkEntry = (where, entry) => {
+    if (entry === "regime") return;
+    if (entry && typeof entry === "object" && entry.regimes) { for (const [k, e] of Object.entries(entry.regimes)) checkEntry(`${where}.regimes["${k}"]`, e); return; }
+    const shape = typeof entry === "string" ? entry : entry?.shape;
+    if (![...SHAPES, "skip"].includes(shape) || (typeof entry !== "string" && shape === "skip")) problems.push(`${where} shape "${shape}" — use ${SHAPES.join(", ")}, "skip" or "regime"`);
+  };
+  for (const [label, entry] of Object.entries(config.strategy.labelStrategies)) {
+    if (!LABELS[label]) problems.push(`labelStrategies has unknown label "${label}" — use ${Object.keys(LABELS).join(", ")}`);
+    checkEntry(`labelStrategies["${label}"]`, entry);
+  }
+  checkEntry("unlabeledStrategy", config.strategy.unlabeledStrategy);
+  for (const [label, ind] of [...Object.entries(config.strategy.labelIndicators), ["(unlabeled)", config.strategy.unlabeledIndicators]]) {
+    if (label !== "(unlabeled)" && !LABELS[label]) problems.push(`labelIndicators has unknown label "${label}"`);
+    if (!INDICATOR_GATES[ind.gate]) problems.push(`labelIndicators["${label}"].gate "${ind.gate}" — use ${Object.keys(INDICATOR_GATES).join(", ")}`);
+    if (!INDICATOR_EXITS[ind.exit]) problems.push(`labelIndicators["${label}"].exit "${ind.exit}" — use ${Object.keys(INDICATOR_EXITS).join(", ")}`);
+  }
+  const POOL_RULES = ["fee24", "tvl", "fit", "largest", "smallest"];
+  for (const [label, rule] of Object.entries(config.strategy.labelPoolRules)) {
+    if (!LABELS[label]) problems.push(`labelPoolRules has unknown label "${label}"`);
+    if (!POOL_RULES.includes(rule)) problems.push(`labelPoolRules["${label}"] = "${rule}" — use ${POOL_RULES.join(", ")}`);
+  }
+  if (!POOL_RULES.includes(config.strategy.unlabeledPoolRule)) problems.push(`unlabeledPoolRule "${config.strategy.unlabeledPoolRule}" — use ${POOL_RULES.join(", ")}`);
+  for (const [mint, c] of Object.entries(config.strategy.coinLabels)) {
+    if (c?.label != null && !LABELS[c.label]) problems.push(`coin-labels.json ${c.symbol ?? mint}: unknown label "${c.label}"`);
+  }
+  for (const [key, entry] of Object.entries(config.strategy.regimeStrategies)) {
+    const shape = typeof entry === "string" ? entry : entry?.shape;
+    if (![...SHAPES, "skip"].includes(shape) || (typeof entry !== "string" && shape === "skip")) problems.push(`regimeStrategies["${key}"] shape "${shape}" — use ${SHAPES.join(", ")} or "skip"`);
+    if (entry && typeof entry === "object") {
+      if (entry.rangeVolMult !== undefined && !(entry.rangeVolMult > 0)) problems.push(`regimeStrategies["${key}"].rangeVolMult must be > 0`);
+      if (entry.stopLossPct != null && !(entry.stopLossPct < 0)) problems.push(`regimeStrategies["${key}"].stopLossPct must be negative or null`);
+      if (entry.outOfRangeWaitMinutes !== undefined && !(entry.outOfRangeWaitMinutes >= 0)) problems.push(`regimeStrategies["${key}"].outOfRangeWaitMinutes must be ≥ 0`);
+    }
+  }
+  const th = config.strategy.regimeThresholds;
+  if (!(th.trendPct > 0) || !(th.lowVol > 0) || !(th.highVol > th.lowVol)) problems.push("regime thresholds need trendPct > 0 and 0 < lowVol < highVol");
+  for (const tier of config.screening.enabledTiers ?? []) {
+    if (!config.screening.tiers[tier]) problems.push(`unknown tier "${tier}" in enabledTiers — use ${Object.keys(config.screening.tiers).join(", ")}`);
+  }
+  return problems;
+}
 
 // Shadow applies to every existing transaction path, including CLI commands.
 if (config.standalone.shadow) process.env.DRY_RUN = "true";
