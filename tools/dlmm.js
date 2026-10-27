@@ -352,24 +352,6 @@ export async function deployPosition({
     );
   }
 
-  if (process.env.DRY_RUN === "true") {
-    return {
-      dry_run: true,
-      would_deploy: {
-        pool_address,
-        strategy: activeStrategy,
-        bins_below: activeBinsBelow,
-        bins_above: activeBinsAbove,
-        downside_pct: downside_pct ?? null,
-        upside_pct: upside_pct ?? null,
-        amount_x: finalAmountX,
-        amount_y: finalAmountY,
-        wide_range: totalBins > 69,
-      },
-      message: "DRY RUN — no transaction sent",
-    };
-  }
-
   const isWideRange = totalBins > 69;
   const minBinId = activeBin.binId - activeBinsBelow;
   const maxBinId = isSingleSidedSol ? activeBin.binId : activeBin.binId + activeBinsAbove;
@@ -384,6 +366,25 @@ export async function deployPosition({
   }
 
   await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
+
+  if (process.env.DRY_RUN === "true") {
+    await before_submit();
+    return {
+      dry_run: true,
+      would_deploy: {
+        pool_address,
+        strategy: activeStrategy,
+        bins_below: activeBinsBelow,
+        bins_above: activeBinsAbove,
+        downside_pct: downside_pct ?? null,
+        upside_pct: upside_pct ?? null,
+        amount_x: finalAmountX,
+        amount_y: finalAmountY,
+        wide_range: isWideRange,
+      },
+      message: "DRY RUN — no transaction sent",
+    };
+  }
 
   const minPrice = Number(getPriceOfBinByBinId(minBinId, actualBinStep).toString());
   const maxPrice = Number(getPriceOfBinByBinId(maxBinId, actualBinStep).toString());

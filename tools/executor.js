@@ -318,7 +318,8 @@ async function runSafetyChecks(name, args) {
       }
 
       // Check SOL balance
-      if (process.env.DRY_RUN !== "true") {
+      // Dry run checks only against a configured simulated balance.
+      if (process.env.DRY_RUN !== "true" || config.standalone.dryRunSolBalance != null) {
         const balance = await getWalletBalances({ force: true, nativeOnly: true });
         if (balance.error || !Number.isFinite(balance.sol)) return { pass: false, reason: "Balance read unavailable" };
         const gasReserve = config.management.gasReserve;

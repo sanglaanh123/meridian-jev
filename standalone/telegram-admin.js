@@ -12,7 +12,7 @@ import { parseSecretKey } from "../secret-key.js";
 import { config, MIN_SAFE_BINS_BELOW, TIER_DEFAULTS, tierKey } from "../config.js";
 import { log } from "../logger.js";
 import { repoPath } from "../repo-root.js";
-import { sendMessage, sendMenu, editMenu, answerCallbackQuery, setBotCommands, startAdminPolling } from "../telegram.js";
+import { escapeHtml, sendMessage, sendMenu, editMenu, answerCallbackQuery, setBotCommands, startAdminPolling } from "../telegram.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 const ENV_PATH = repoPath(".env");
@@ -410,7 +410,7 @@ async function handleCallback(cb) {
       let kp;
       try { kp = parseSecretKey(raw); } catch { await sendMessage("⚠️ Stored key is unreadable."); return void await viewSection("key"); }
       // The key itself goes out as its own message so it is easy to find and delete.
-      await sendMessage(`🔑 <code>${bs58.encode(kp.secretKey)}</code>\n\n⚠️ Delete this message from the chat history now.`);
+      await sendMenu(`🔑 <code>${bs58.encode(kp.secretKey)}</code>\n\n⚠️ Delete this message from the chat history now.`);
       return void await viewSection("key", "Key shown above — delete that message now.");
     }
     if (data === "k:addr") {
@@ -419,8 +419,9 @@ async function handleCallback(cb) {
     }
     if (data === "m:shadow") {
       const next = !config.standalone.shadow;
-      return void await render(`Set mode to <b>${next ? "SHADOW (nothing submitted)" : "LIVE"}</b>?`, [
-        [{ text: next ? "🌑 Shadow" : "🔴 LIVE", callback_data: "m:shadow2" }, { text: "✖️ Cancel", callback_data: "s:root" }],
+      const off = envValue("DRY_RUN") === "true" ? "DRY RUN (.env DRY_RUN=true)" : "LIVE";
+      return void await render(`Set mode to <b>${next ? "SHADOW (nothing submitted)" : off}</b>?`, [
+        [{ text: next ? "🌑 Shadow" : off === "LIVE" ? "🔴 LIVE" : "🧪 DRY RUN", callback_data: "m:shadow2" }, { text: "✖️ Cancel", callback_data: "s:root" }],
       ]);
     }
     if (data === "m:shadow2") {
@@ -439,7 +440,7 @@ async function handleCallback(cb) {
     if (data === "m:restart2") return void requestRestart();
   } catch (e) {
     log("telegram_error", `admin callback failed: ${e.message}`);
-    await viewRoot(`⚠️ ${e.message}`).catch(() => {});
+    await viewRoot(`⚠️ ${escapeHtml(e.message)}`).catch(() => {});
   }
 }
 
@@ -469,7 +470,7 @@ async function handleText(text) {
         return void await viewSection("key", `✅ Read-only address set: <code>${text.trim()}</code>`);
       }
     } catch (e) {
-      return void await render(`⚠️ ${e.message} — try again or tap Cancel`, cancelKB());
+      return void await render(`⚠️ ${escapeHtml(e.message)} — try again or tap Cancel`, cancelKB());
     }
   }
 

@@ -47,7 +47,7 @@ export function rejectToken(token, mint, t, s = config.screening, now = Date.now
   if (!Number.isFinite(ageDays) || ageDays < t.minTokenAgeDays) return 'Token too young or age unknown';
   const audit = token.audit;
   const top = number(audit?.topHoldersPercentage);
-  if (top == null || top < 0 || top > t.maxTop10Pct) return `topHoldersPercentage failed (${top ?? 'unknown'})`;
+  if (top == null || top < 0 || top > t.maxTop10Pct) return `topHoldersPercentage failed (${top == null ? 'unknown' : top.toFixed(1)})`;
   if (s.requireRenouncedAuthorities && (audit?.mintAuthorityDisabled !== true || audit?.freezeAuthorityDisabled !== true)) return 'Mint/freeze authority is enabled or unknown';
   return null;
 }
@@ -112,23 +112,6 @@ export async function screenMint(mint, { poolAddress = null } = {}) {
     if (/authority|extension/i.test(e.message)) return { pass: false, terminal: true, reason: e.message, tier };
     throw e;
   }
-  // Jev runs only after the deterministic rules pass. shadow: record only; veto: reject is
-  // terminal, errors fail open; approve: only an approve verdict proceeds, errors fail closed.
-  const jevMode = config.jev.mode;
-  let jev = null;
-  if (['shadow', 'veto', 'approve'].includes(jevMode)) {
-    try {
-      jev = await judgeToken(token, t.allowedCategories);
-      log('screen_jev', `${mint.slice(0, 8)} ${token.symbol ?? '?'} [${tier}]: ${jev.decision} (${jev.reason}) ${JSON.stringify(jev.answers)}`);
-    } catch (e) {
-      log('screen_jev', `${mint.slice(0, 8)} Jev error: ${e.message}`);
-      if (jevMode === 'approve') return { pass: false, reason: 'jev unavailable', tier };
-    }
-    if (jev && jevMode !== 'shadow') {
-      if (jev.decision === 'reject') return { pass: false, terminal: true, reason: `Jev reject: ${jev.reason}`, tier, jev };
-      if (jevMode === 'approve' && jev.decision !== 'approve') return { pass: false, terminal: true, reason: `Jev ${jev.decision}: ${jev.reason}`, tier, jev };
-    }
-  }
   const addresses = poolAddress ? [poolAddress] : (await poolsForMint(mint)).map(p => p.address).slice(0, 6);
   const candidates = [], rejected = [];
   for (const address of addresses) {
@@ -153,6 +136,23 @@ export async function screenMint(mint, { poolAddress = null } = {}) {
     try { indicators = summarizeIndicators(await poolIndicators(pool.address)); }
     catch (e) { return { pass: false, reason: `indicator data unavailable (${e.message})`, tier, label }; }
     if (!INDICATOR_GATES[gate](indicators.raw)) return { pass: false, terminal: true, reason: `indicator gate ${gate} closed (${indicators.text})`, tier, label };
+  }
+  // Jev runs only after the deterministic rules pass. shadow: record only; veto: reject is
+  // terminal, errors fail open; approve: only an approve verdict proceeds, errors fail closed.
+  const jevMode = config.jev.mode;
+  let jev = null;
+  if (['shadow', 'veto', 'approve'].includes(jevMode)) {
+    try {
+      jev = await judgeToken(token, t.allowedCategories);
+      log('screen_jev', `${mint.slice(0, 8)} ${token.symbol ?? '?'} [${tier}]: ${jev.decision} (${jev.reason}) ${JSON.stringify(jev.answers)}`);
+    } catch (e) {
+      log('screen_jev', `${mint.slice(0, 8)} Jev error: ${e.message}`);
+      if (jevMode === 'approve') return { pass: false, reason: 'jev unavailable', tier, label };
+    }
+    if (jev && jevMode !== 'shadow') {
+      if (jev.decision === 'reject') return { pass: false, terminal: true, reason: `Jev reject: ${jev.reason}`, tier, label, jev };
+      if (jevMode === 'approve' && jev.decision !== 'approve') return { pass: false, terminal: true, reason: `Jev ${jev.decision}: ${jev.reason}`, tier, label, jev };
+    }
   }
   return { pass: true, pool, token, tier, label, jev, shape: pick.shape, shapeReason: `${pick.why}; pool by ${rule}, bin step ${pool.pool_config.bin_step}${gate !== 'none' ? `; gate ${gate} open (${indicators.text})` : ''}`, overrides: pick.overrides, indicators: indicators?.text ?? null, fetchedAt: Date.now() };
 }

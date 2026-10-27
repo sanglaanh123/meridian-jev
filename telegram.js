@@ -116,6 +116,7 @@ export function startAdminPolling(onUpdate) {
   let offset = null;
   let stopped = false;
   let timer = null;
+  let lastError = null;
 
   async function poll() {
     try {
@@ -127,6 +128,7 @@ export function startAdminPolling(onUpdate) {
       const res = await fetch(`${BASE}/getUpdates?${params}`, { signal: AbortSignal.timeout(30_000) });
       if (!res.ok) throw new Error(`getUpdates ${res.status}`);
       const updates = (await res.json()).result || [];
+      lastError = null;
       if (offset == null) {
         // First successful poll: skip the pre-start backlog entirely.
         offset = updates.length ? updates[updates.length - 1].update_id + 1 : 0;
@@ -149,7 +151,13 @@ export function startAdminPolling(onUpdate) {
           }
         }
       }
-    } catch { /* transient network/API errors — next tick retries */ }
+    } catch (e) {
+      // Transient errors retry on the next tick; a changed error is logged once.
+      if (e.message !== lastError) {
+        lastError = e.message;
+        log("telegram_warn", `Admin polling error: ${e.message}`);
+      }
+    }
     if (!stopped) timer = setTimeout(poll, 2000);
   }
 
@@ -157,6 +165,9 @@ export function startAdminPolling(onUpdate) {
   log("telegram", `Admin console polling active (${allowed.length} authorized user(s))`);
   return () => { stopped = true; clearTimeout(timer); };
 }
+
+/** Escape dynamic text for Telegram HTML parse mode. */
+export const escapeHtml = s => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee }) {
   const priceStr = priceRange
@@ -169,7 +180,7 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
     ? `Bin step: ${binStep ?? "?"}  |  Base fee: ${baseFee != null ? baseFee + "%" : "?"}\n`
     : "";
   await sendHTML(
-    `✅ <b>Deployed</b> ${pair}\n` +
+    `✅ <b>Deployed</b> ${escapeHtml(pair)}\n` +
     `Amount: ${amountSol} SOL\n` +
     priceStr +
     coverageStr +
@@ -182,14 +193,14 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
 export async function notifyClose({ pair, pnlUsd, pnlPct }) {
   const sign = pnlUsd >= 0 ? "+" : "";
   await sendHTML(
-    `🔒 <b>Closed</b> ${pair}\n` +
+    `🔒 <b>Closed</b> ${escapeHtml(pair)}\n` +
     `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
   );
 }
 
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
   await sendHTML(
-    `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
+    `🔄 <b>Swapped</b> ${escapeHtml(inputSymbol)} → ${escapeHtml(outputSymbol)}\n` +
     `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
     `Tx: <code>${tx?.slice(0, 16)}...</code>`
   );

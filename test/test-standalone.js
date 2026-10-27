@@ -13,6 +13,8 @@ import { Keypair } from "@solana/web3.js";
 import { config, validateConfig } from "../config.js";
 import { MonitorStore, acceptPoolSignal, signalBlocked, finishSignal, finishStaleSignals } from "../standalone/store.js";
 import { aggregateTokenAccounts } from "../standalone/balances.js";
+import { INDICATOR_GATES } from "../standalone/indicators.js";
+import { escapeHtml } from "../telegram.js";
 import { tierFor, tierLimits, rejectToken, rejectPool } from "../standalone/screening.js";
 import { realizedVolatility } from "../standalone/meteora.js";
 import { listFilter, preselect, interleaveTiers, scanOnce } from "../standalone/scanner.js";
@@ -331,7 +333,9 @@ console.log("\n[11] Jev bluechip classifier");
       return json({ answers: jevAnswers });
     }
     if (u.includes("datapi.jup.ag")) return json([token({ id: mint, name: "Jupiter", symbol: "JUP", website: "https://jup.ag", twitter: "https://x.com/JupiterExchange", dev: "DevX" })]);
-    if (u.includes("dlmm.datapi.meteora.ag")) return json({ data: [] });
+    if (u.includes("/ohlcv")) return json({ data: Array.from({ length: 25 }, (_, i) => ({ close: 1 + (i % 2) * 0.002 })) });
+    if (u.includes(`dlmm.datapi.meteora.ag/pools/${POOL_A}`)) return json(pool({ token_x: { address: mint, market_cap: 9e8 } }));
+    if (u.includes("dlmm.datapi.meteora.ag")) return json({ data: [pool({ token_x: { address: mint, market_cap: 9e8 } })] });
     if (u.includes("/rpc")) return rpcStub(opts, TOKEN_PROGRAMS);
     throw new Error(`unexpected fetch ${u}`);
   };
@@ -346,7 +350,7 @@ console.log("\n[11] Jev bluechip classifier");
     config.jev.mode = "approve";
     mint = newMint(); globalThis.fetch = stub(mint);
     r = await screenMint(mint);
-    check("approve verdict proceeds to pool search", jevCalls === 1 && /No eligible/.test(r.reason) && r.tier === "bluechip", r.reason);
+    check("approve verdict passes with the verdict attached", jevCalls === 1 && r.pass === true && r.jev?.decision === "approve" && r.tier === "bluechip", r.reason);
     check("request sends bearer key, model and typed questions", jevHeaders?.Authorization === "Bearer test-key-not-real" && jevBody?.model === "jev-latest" && jevBody.questions.established.type === "noul" && Object.keys(jevBody.questions.category.criteria).length === 6);
     check("only identity text is sent", Object.keys(jevBody.state.token).every(k => ["name", "symbol", "verified", "tags", "twitter", "website"].includes(k)) && !JSON.stringify(jevBody).includes("mcap"));
     await screenMint(mint);
@@ -368,7 +372,7 @@ console.log("\n[11] Jev bluechip classifier");
 
     config.jev.mode = "veto"; mint = newMint(); globalThis.fetch = stub(mint);
     r = await screenMint(mint);
-    check("veto mode: Jev error lets the entry pass", /No eligible/.test(r.reason), r.reason);
+    check("veto mode: Jev error lets the entry pass", r.pass === true && !r.jev, r.reason);
     jevFail = false; jevAnswers = ans({ impersonation: { noul: 0.95 } });
     mint = newMint(); globalThis.fetch = stub(mint);
     r = await screenMint(mint);
@@ -376,9 +380,18 @@ console.log("\n[11] Jev bluechip classifier");
 
     config.jev.mode = "shadow"; mint = newMint(); globalThis.fetch = stub(mint);
     r = await screenMint(mint);
-    check("shadow mode never blocks even on a reject verdict", /No eligible/.test(r.reason), r.reason);
+    check("shadow mode never blocks even on a reject verdict", r.pass === true && r.jev?.decision === "reject", r.reason);
     const j = await judgeToken({ id: mint }, allowed);
     check("cached answers re-evaluate per tier categories", j.decision === "reject" && jevCalls > 0);
+    // Jev runs last: a closed indicator gate (here: no candles) must not cost a Jev call.
+    const gateSaved = config.strategy.unlabeledIndicators;
+    config.strategy.unlabeledIndicators = { gate: Object.keys(INDICATOR_GATES).find(g => g !== "none"), exit: "none" };
+    config.jev.mode = "approve"; jevFail = false; jevAnswers = ans();
+    mint = newMint(); globalThis.fetch = stub(mint);
+    const before = jevCalls;
+    r = await screenMint(mint);
+    config.strategy.unlabeledIndicators = gateSaved;
+    check("Jev is not called when the indicator gate rejects", r.pass === false && /indicator/.test(r.reason) && jevCalls === before, r.reason);
   } finally {
     globalThis.fetch = realFetch;
     Object.assign(config.jev, saved.jev);
@@ -386,6 +399,9 @@ console.log("\n[11] Jev bluechip classifier");
     if (saved.key === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = saved.key;
   }
 }
+
+console.log("\n[11b] escapeHtml");
+check("escapes &, < and >", escapeHtml("A&B <x> ->") === "A&amp;B &lt;x&gt; -&gt;" && escapeHtml(null) === "");
 
 console.log("\n[12] backtest simulator");
 {

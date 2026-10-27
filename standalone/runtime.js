@@ -201,9 +201,9 @@ async function attemptEntry(signal) {
     record.amountSol = amountY;
     store.save();
     finishSignal(store, signal, record.status === "proposed" ? "shadow proposal recorded" : "entered", config.standalone);
-    const label = result.dry_run ? "[SHADOW] Would deploy" : "Deployed";
+    const label = result.dry_run ? `[${modeLabel().toUpperCase()}] Would deploy` : "Deployed";
     log("entry", `${label} ${amountY} SOL → ${pool.name ?? pool.address.slice(0, 8)} [${tier}] ${screened.shape} (${screened.shapeReason}; ${binsBelow} bins below, bin step ${binStep}, vol ${pool.daily_vol_pct.toFixed(1)}%/day, fee/TVL ${pool.fee_tvl_ratio["24h"].toFixed(3)}%/day)`);
-    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.name ?? pool.address.slice(0, 8)} [${tier}] ${screened.shape}\n${screened.shapeReason} · fee/TVL ${pool.fee_tvl_ratio["24h"].toFixed(3)}%/day · vol ${pool.daily_vol_pct.toFixed(1)}%/day · ${binsBelow} bins${screened.jev ? `\nJev: ${screened.jev.decision} — ${screened.jev.reason}` : ""}`);
+    void notify(`${result.dry_run ? `🕯️ ${modeLabel() === "shadow" ? "Shadow" : "Dry-run"} proposal` : "✅ Entry"}: ${amountY} SOL → ${pool.name ?? pool.address.slice(0, 8)} [${tier}] ${screened.shape}\n${screened.shapeReason} · fee/TVL ${pool.fee_tvl_ratio["24h"].toFixed(3)}%/day · vol ${pool.daily_vol_pct.toFixed(1)}%/day · ${binsBelow} bins${screened.jev ? `\nJev: ${screened.jev.decision} — ${screened.jev.reason}` : ""}`);
     return null;
   }
 
