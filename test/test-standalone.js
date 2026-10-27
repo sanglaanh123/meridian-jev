@@ -324,6 +324,7 @@ const rpcStub = async (opts, TOKEN_PROGRAMS) => {
   config.jev.mode = "off";
   const BLUE_MINT = Keypair.generate().publicKey.toBase58();
   let listFails = false;
+  let tokenOverride = {};
   globalThis.fetch = async (url, opts = {}) => {
     const u = String(url);
     if (u.includes("dlmm.datapi.meteora.ag/pools?")) {
@@ -332,7 +333,7 @@ const rpcStub = async (opts, TOKEN_PROGRAMS) => {
     }
     if (u.includes("/ohlcv")) return json({ data: Array.from({ length: 25 }, (_, i) => ({ close: 1 + (i % 2) * 0.002 })) });
     if (u.includes("dlmm.datapi.meteora.ag/pools/PoolBlueLive")) return json(pool({ address: "PoolBlueLive", token_x: { address: BLUE_MINT, market_cap: 9e8 } }));
-    if (u.includes("datapi.jup.ag")) return json([token({ id: BLUE_MINT })]);
+    if (u.includes("datapi.jup.ag")) return json([token({ id: BLUE_MINT, ...tokenOverride })]);
     if (u.includes("/rpc")) return rpcStub(opts, TOKEN_PROGRAMS);
     throw new Error(`unexpected fetch ${u}`);
   };
@@ -355,6 +356,19 @@ const rpcStub = async (opts, TOKEN_PROGRAMS) => {
     const preview = tempStore();
     report = await scanOnce({ store: preview, emit: false, options, readPositions: noPositions });
     check("preview screens without storing", report.candidates.length === 1 && report.candidates[0].pass && Object.keys(preview.data.signals).length === 0);
+
+    // A token-rule failure on fresh data parks the mint so later scans reach other mints.
+    tokenOverride = { audit: { mintAuthorityDisabled: true, freezeAuthorityDisabled: true, topHoldersPercentage: 95 } };
+    const parked = tempStore();
+    report = await scanOnce({ store: parked, options, readPositions: noPositions });
+    check("token-rule reject is parked for the cooldown", /topHoldersPercentage/.test(report.candidates[0]?.reason ?? "") && parked.data.signals[BLUE_MINT]?.done === true && signalBlocked(parked, BLUE_MINT), JSON.stringify(report.candidates));
+    report = await scanOnce({ store: parked, options, readPositions: noPositions });
+    check("parked mint is not re-screened next scan", report.candidates.length === 0);
+    tokenOverride = { updatedAt: new Date(Date.now() - 3_600_000).toISOString() };
+    const stale = tempStore();
+    report = await scanOnce({ store: stale, options, readPositions: noPositions });
+    check("stale token data is retried, not parked", /stale/.test(report.candidates[0]?.reason ?? "") && !stale.data.signals[BLUE_MINT]);
+    tokenOverride = {};
 
     listFails = true;
     report = await scanOnce({ store: tempStore(), options, readPositions: noPositions });

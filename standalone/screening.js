@@ -33,6 +33,8 @@ export function tierLimits(openByTier, tier, s = config.screening) {
   return { open, max, full: open >= max };
 }
 
+const RETRYABLE_TOKEN_REJECTS = new Set(['Token mint mismatch', 'Token data is stale or has no timestamp']);
+
 export function rejectToken(token, mint, t, s = config.screening, now = Date.now()) {
   if (token?.id !== mint) return 'Token mint mismatch';
   const updated = Date.parse(token.updatedAt);
@@ -103,7 +105,9 @@ export async function screenMint(mint, { poolAddress = null } = {}) {
   if (token && !tier) return { pass: false, terminal: true, reason: 'Market cap below the midcap floor or tier disabled' };
   const t = s.tiers[tier];
   const reason = rejectToken(token, mint, t ?? {}, s);
-  if (reason) return { pass: false, reason, tier };
+  // A fresh token record that fails a rule is a fact for this window; only a missing
+  // or stale record is worth retrying. Terminal rejects park the mint in the scanner.
+  if (reason) return { pass: false, terminal: !RETRYABLE_TOKEN_REJECTS.has(reason), reason, tier };
   if (token.dev ? isDevBlocked(token.dev) : Object.keys(getBlockedDevs()).length > 0) return { pass: false, terminal: true, reason: 'Deployer blocked or unavailable' };
   try {
     await checkMintOnChain(mint);
@@ -114,6 +118,7 @@ export async function screenMint(mint, { poolAddress = null } = {}) {
   }
   const addresses = poolAddress ? [poolAddress] : (await poolsForMint(mint)).map(p => p.address).slice(0, 6);
   const candidates = [], rejected = [];
+  let readFailed = false;
   for (const address of addresses) {
     if (isPoolOnCooldown(address)) { rejected.push('Pool cooldown'); continue; }
     try {
@@ -121,9 +126,10 @@ export async function screenMint(mint, { poolAddress = null } = {}) {
       const why = rejectPool(p, mint, t, s);
       if (why) { rejected.push(why); continue; }
       candidates.push(p);
-    } catch (e) { rejected.push(e.message); }
+    } catch (e) { rejected.push(e.message); readFailed = true; }
   }
-  if (!candidates.length) return { pass: false, reason: rejected.slice(0, 3).join('; ') || 'No eligible token/SOL pool', tier };
+  // Every pool failing the rules is terminal; a failed pool read is retried.
+  if (!candidates.length) return { pass: false, terminal: !readFailed, reason: rejected.slice(0, 3).join('; ') || 'No eligible token/SOL pool', tier };
   // Shape follows each pool's regime under strategy "auto"; the label's pool rule picks the pool.
   const label = config.strategy.coinLabels[mint]?.label ?? null;
   const chosen = choosePool(candidates, { label, tier: t });
