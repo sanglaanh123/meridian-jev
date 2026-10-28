@@ -32,7 +32,7 @@ The app is a bluechip and mid-cap Meteora DLMM farmer (token-X / SOL pools). Ent
 
 ## Invariants
 
-- Entries require a fresh scanner signal, then full tier screening (token, pool, volatility) and pre-submit rechecks. Do not expose an entry bypass through the CLI.
+- Entries require a fresh scanner signal, then full tier screening (token, pool, volatility) and pre-submit rechecks. Manual pools are an explicit `manualPools` list: safety checks and the auto shape, no tier bands. Do not expose an entry bypass through the CLI.
 - Tier thresholds live in `config.screening.tiers` (flat `<tier><Field>` user keys). Tokens below the lowest enabled tier are rejected.
 - `shadowMode` forces `DRY_RUN=true` across transaction paths.
 - Missing data must not be interpreted as empty positions, spendable funds, or calm volatility.

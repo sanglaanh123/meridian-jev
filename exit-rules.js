@@ -27,8 +27,10 @@ export function getDeterministicCloseRule(position, managementConfig) {
   if (!pnlSuspect && position.pnl_pct != null && stopLossPct != null && position.pnl_pct <= stopLossPct) {
     return { action: "CLOSE", rule: 1, reason: "stop loss" };
   }
-  // takeProfitPct null = off: long farming lets fees accrue instead of capping upside.
-  if (!pnlSuspect && position.pnl_pct != null && managementConfig.takeProfitPct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
+  // Per-position take_profit_pct wins, including null (off). Else the global value.
+  // null = off: long farming lets fees accrue instead of capping upside.
+  const takeProfitPct = tracked && "take_profit_pct" in tracked ? tracked.take_profit_pct : managementConfig.takeProfitPct;
+  if (!pnlSuspect && position.pnl_pct != null && takeProfitPct != null && position.pnl_pct >= takeProfitPct) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
   }
   if (

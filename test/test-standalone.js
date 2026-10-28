@@ -669,5 +669,79 @@ console.log("\n[15] Secret key formats");
   try { parseSecretKey("word ".repeat(12)); check("seed phrase rejected", false); } catch (e) { check("seed phrase rejected", /Seed phrases/.test(e.message)); }
 }
 
+console.log("\n[16] Manual pools");
+{
+  const saved = {
+    pools: config.manual.pools,
+    poolsInvalid: config.manual.poolsInvalid,
+    checkMin: config.manual.checkMin,
+    takeProfitPct: config.manual.takeProfitPct,
+    stopLossPct: config.manual.stopLossPct,
+  };
+  config.manual.pools = [{ pool: "" }];
+  check("empty manual pool is reported", validateConfig().some(p => p.includes("pool is empty")));
+  config.manual.pools = [{ pool: "JUP-SOL" }, { pool: "jup-sol" }];
+  check("duplicate manual pool is reported", validateConfig().some(p => p.includes("duplicates")));
+  config.manual.pools = [{ pool: "JUP-SOL", takeProfitPct: 0 }];
+  check("non-positive manual take profit is reported", validateConfig().some(p => p.includes("takeProfitPct")));
+  config.manual.pools = [{ pool: "JUP-SOL", stopLossPct: 5 }];
+  check("non-negative manual stop is reported", validateConfig().some(p => p.includes("stopLossPct")));
+  config.manual.pools = [{ pool: "JUP-SOL", shape: "nope" }];
+  check("unknown manual shape is reported", validateConfig().some(p => p.includes("shape")));
+  config.manual.pools = saved.pools;
+  config.manual.takeProfitPct = 0;
+  check("global manual take profit must be positive or null", validateConfig().some(p => p.includes("manualTakeProfitPct")));
+  Object.assign(config.manual, saved);
+  check("restored config still validates", validateConfig().length === 0, validateConfig().join("; "));
+
+  const manual = await import("../standalone/manual.js");
+  const addr = Keypair.generate().publicKey.toBase58();
+  check("a pool address is not a name search", manual.isPoolAddress(addr) && !manual.isPoolAddress("JUP-SOL"));
+  const sol = config.tokens.SOL;
+  const row = (address, name) => ({ address, name, token_x: { address: "mint" }, token_y: { address: sol } });
+  let listed = false;
+  const resolved = await manual.resolveManualPool({ pool: addr }, { getPool: async a => ({ address: a }), listPools: async () => { listed = true; return []; } });
+  check("an address resolves without listing pools", resolved.address === addr && !listed);
+  const unique = await manual.resolveManualPool({ pool: "JUP-SOL" }, { listPools: async () => [row("A", "JUP-SOL"), row("B", "BONK-SOL")] });
+  check("a unique pool name resolves", unique.address === "A");
+  const ambiguous = await manual.resolveManualPool({ pool: "JUP-SOL" }, { listPools: async () => [row("A", "JUP-SOL"), row("B", "JUP-SOL")] });
+  check("an ambiguous pool name does not resolve", ambiguous.address == null && ambiguous.matches.length === 2);
+
+  const quiet = {
+    token_x: { address: "mintquiet" },
+    token_y: { address: sol },
+    is_blacklisted: false,
+    current_price: 1,
+    daily_vol_pct: 4,
+    tvl: 1,
+    volume: { "24h": 1 },
+    pool_config: { bin_step: 20 },
+    fee_tvl_ratio: { "24h": 0, "4h": 0 },
+    created_at: Date.now(),
+  };
+  check("manual safety ignores tier bands", manual.manualSafety(quiet) == null);
+  check("the same pool still fails tier rules", typeof rejectPool(quiet, "mintquiet", config.screening.tiers.bluechip) === "string");
+
+  const oor = { action: "CLOSE", rule: 4, reason: "OOR" };
+  check("a manual out-of-range close rebalances", manual.manualExitDecision({ source: "manual" }, { closeRule: oor })?.reason === "rebalance");
+  check("a manual stop loss closes with a stop cooldown", manual.manualExitDecision({ source: "manual" }, { closeRule: { reason: "stop loss" } })?.cooldown === "stop");
+  check("a scanner out-of-range close stays a close", manual.manualExitDecision({ tier: "bluechip" }, { closeRule: oor })?.reason === "OOR");
+  check("manual low yield does not close", manual.manualExitDecision({ source: "manual" }, { exit: { reason: "Low yield: fee/TVL 0.01% < min 0.02%" } }) == null);
+  check("manual time out of range rebalances", manual.manualExitDecision({ source: "manual" }, { exit: { reason: "Out of range for 120m (limit: 120m)" } })?.action === "rebalance");
+  check("a price above the range rebalances", manual.manualExitDecision({ source: "manual" }, { closeRule: { reason: "pumped far above range" } })?.action === "rebalance");
+  const now = 1_000_000;
+  const sl = manual.manualCooldownRecord({ action: "close", cooldown: "stop" }, now);
+  const tp = manual.manualCooldownRecord({ action: "close", cooldown: "tp" }, now);
+  const rb = manual.manualCooldownRecord({ action: "rebalance" }, now);
+  check("stop cooldown is 360 minutes and rebalance is immediate", sl.until - now === 360 * 60_000 && !manual.manualCooldownActive(rb, now));
+  check("take-profit cooldown is 60 minutes", tp.until - now === 60 * 60_000 && manual.manualCooldownActive(tp, now));
+
+  trackPosition({ position: "ManualTpPos", pool: "PoolManual", pool_name: "M-SOL", strategy: "bid_ask", amount_sol: 0.5, take_profit_pct: 4, source: "manual" });
+  trackPosition({ position: "ManualTpOff", pool: "PoolManualOff", pool_name: "M-SOL", strategy: "bid_ask", amount_sol: 0.5, take_profit_pct: null, source: "manual" });
+  const tpPos = base => ({ position: "ManualTpPos", pnl_pct: 0, active_bin: 100, upper_bin: 100, minutes_out_of_range: 0, age_minutes: 90, fee_per_tvl_24h: 10, ...base });
+  check("per-position take profit fires while the global value is off", getDeterministicCloseRule(tpPos({ pnl_pct: 5 }), { ...config.management, takeProfitPct: null })?.rule === 2);
+  check("a stored null take profit stays off", getDeterministicCloseRule({ ...tpPos({ pnl_pct: 20 }), position: "ManualTpOff" }, { ...config.management, takeProfitPct: 5 }) == null);
+}
+
 console.log(failed === 0 ? "\nALL TESTS PASSED" : `\n${failed} TEST(S) FAILED`);
 process.exit(failed === 0 ? 0 : 1);

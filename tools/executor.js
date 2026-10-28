@@ -8,6 +8,7 @@ import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
 import { poolWithVolatility } from "../standalone/meteora.js";
 import { rejectPool } from "../standalone/screening.js";
+import { manualSafety } from "../standalone/manual.js";
 function numberOrNull(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
@@ -26,6 +27,28 @@ async function validateDeployPoolThresholds(args) {
   }
   const why = rejectPool(detail, detail?.token_x?.address, tier, config.screening);
   if (why) return { pass: false, reason: `Pool failed ${args.tier} rules before deploy: ${why}` };
+  return {
+    pass: true,
+    entryMarketData: {
+      entry_mcap: numberOrNull(detail.token_x?.market_cap),
+      entry_tvl: numberOrNull(detail.tvl),
+      entry_volume: numberOrNull(detail.volume?.["24h"]),
+      entry_holders: numberOrNull(detail.token_x?.holders),
+      base_mint: detail.token_x?.address,
+    },
+  };
+}
+
+// User-named pools skip tier bands. Pair, blacklist, price and volatility still have to hold.
+async function validateManualDeploy(args) {
+  let detail;
+  try {
+    detail = await poolWithVolatility(args.pool_address);
+  } catch (error) {
+    return { pass: false, reason: `Could not verify manual pool before deploy: ${error.message}` };
+  }
+  const why = manualSafety(detail);
+  if (why) return { pass: false, reason: `Manual pool blocked: ${why}` };
   return {
     pass: true,
     entryMarketData: {
@@ -199,7 +222,9 @@ async function runSafetyChecks(name, args) {
       if (typeof args.before_submit !== "function") {
         return { pass: false, reason: "Entries require a fresh scanner signal" };
       }
-      const poolThresholds = await validateDeployPoolThresholds(args);
+      const poolThresholds = args.source === "manual"
+        ? await validateManualDeploy(args)
+        : await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
       if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);
 

@@ -243,6 +243,8 @@ export async function deployPosition({
   tier,
   label,
   stop_loss_pct,
+  take_profit_pct,
+  source,
   oor_wait_minutes,
   before_submit,
   on_prepared,
@@ -499,6 +501,8 @@ export async function deployPosition({
       tier,
       label,
       stop_loss_pct,
+      take_profit_pct,
+      source,
       oor_wait_minutes,
     });
 

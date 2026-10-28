@@ -22,6 +22,7 @@ import { getWalletBalances } from "../tools/wallet.js";
 import { getTrackedPositions, getTrackedPosition, confirmPeak, updatePnlAndCheckExits, registerExitSignal, syncOpenPositions } from "../state.js";
 import { recordPositionSnapshot } from "../pool-memory.js";
 import { getDeterministicCloseRule, computeBinsBelow } from "../exit-rules.js";
+import { manualTick, openManualPool, manualExitDecision, manualCooldownRecord } from "./manual.js";
 import { startAdmin } from "./telegram-admin.js";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -35,6 +36,7 @@ let shuttingDown = false;
 let manageBusy = false;
 let pollBusy = false;
 let pursuing = false;
+let manualBusy = false;
 const timers = {};
 const signalQueue = [];
 
@@ -242,7 +244,8 @@ async function finalRecheck(signal, screened) {
 // ─── Exits (deterministic, no LLM) ──────────────────────────────────────────
 
 // One management pass: trailing/rule exits and fee claims. Never triggers
-// screening — an empty portfolio just waits for the next scanner signal.
+// scanner screening — an empty portfolio just waits for the next signal.
+// Manual pools are opened on their own timer.
 export async function manageOnce() {
   if (manageBusy || shuttingDown) return null;
   manageBusy = true;
@@ -259,22 +262,29 @@ export async function manageOnce() {
       // Slow backstop: raise peaks immediately and act on detected exits.
       // Real-time confirmation lives in the fast poller below.
       confirmPeak(p.position, p.pnl_pct, 1);
+      const tracked = getTrackedPosition(p.position);
       const exit = updatePnlAndCheckExits(p.position, p, config.management);
-      const closeRule = exit
-        ? { action: "CLOSE", rule: "exit", reason: exit.reason }
-        : getDeterministicCloseRule(p, config.management);
+      const closeRule = exit ? null : getDeterministicCloseRule(p, config.management);
+      const decision = manualExitDecision(tracked, { exit, closeRule });
       let action = null;
-      if (closeRule?.action === "CLOSE") {
-        action = { tool: "close_position", args: { position_address: p.position, reason: closeRule.reason }, label: `close (${closeRule.reason})` };
-      } else {
+      if (decision) {
+        action = { tool: "close_position", args: { position_address: p.position, reason: decision.reason }, label: `${decision.action === "rebalance" ? "rebalance" : "close"} (${decision.reason})`, decision };
+      } else if (tracked?.source !== "manual") {
         const indicatorExit = await checkIndicatorExit(p);
         if (indicatorExit) action = { tool: "close_position", args: { position_address: p.position, reason: indicatorExit }, label: `close (${indicatorExit})` };
         else if ((p.unclaimed_fees_usd ?? 0) >= config.management.minClaimAmount) {
           action = { tool: "claim_fees", args: { position_address: p.position }, label: "claim fees" };
         }
+      } else if ((p.unclaimed_fees_usd ?? 0) >= config.management.minClaimAmount) {
+        action = { tool: "claim_fees", args: { position_address: p.position }, label: "claim fees" };
       }
       // LLM-set free-text instructions have no execution path in standalone — hold.
       if (!action) continue;
+      if (action.decision) {
+        const { ok, res } = await closeForDecision(p, action.decision);
+        log("manage", `${p.pair ?? p.position.slice(0, 8)}: ${action.label} ${ok ? "done" : `FAILED — ${res?.error || res?.reason || "unknown"}`}`);
+        continue;
+      }
       const res = await executeTool(action.tool, action.args).catch(e => ({ error: e.message }));
       const ok = res?.success !== false && !res?.error && !res?.blocked;
       log("manage", `${p.pair ?? p.position.slice(0, 8)}: ${action.label} ${ok ? "done" : `FAILED — ${res?.error || res?.reason || "unknown"}`}`);
@@ -283,6 +293,40 @@ export async function manageOnce() {
   } finally {
     manageBusy = false;
   }
+}
+
+async function closeForDecision(p, decision) {
+  const tracked = getTrackedPosition(p.position);
+  const res = await executeTool("close_position", { position_address: p.position, reason: decision.reason }).catch(e => ({ error: e.message }));
+  const ok = res?.success !== false && !res?.error && !res?.blocked;
+  if (ok && tracked?.source === "manual") {
+    if (!store?.data) {
+      log("manual_warn", "Manual cooldown was not recorded — runtime store is not open");
+      return { ok, res };
+    }
+    const pool = tracked.pool || p.pool;
+    store.data.manualCooldowns ??= {};
+    store.data.manualCooldowns[pool] = manualCooldownRecord(decision);
+    const mint = p.base_mint || res?.base_mint;
+    if (mint && store.data.attempts[mint]?.source === "manual") delete store.data.attempts[mint];
+    store.save();
+    if (decision.action === "rebalance" && pool) {
+      await openManualPool({
+        pool,
+        ...( "take_profit_pct" in tracked ? { takeProfitPct: tracked.take_profit_pct } : {}),
+        ...( "stop_loss_pct" in tracked ? { stopLossPct: tracked.stop_loss_pct } : {}),
+      }, { executeTool, store });
+    }
+  }
+  return { ok, res };
+}
+
+async function runManualTick() {
+  if (manualBusy || shuttingDown || !config.manual.pools.length) return;
+  manualBusy = true;
+  try { await manualTick({ executeTool, store, shuttingDown: () => shuttingDown }); }
+  catch (e) { log("manual_warn", `Manual tick failed: ${e.message}`); }
+  finally { manualBusy = false; }
 }
 
 // Indicator exit for the position's coin label, checked on the slow management pass
@@ -313,18 +357,18 @@ function startPnlPoller() {
       if (!live?.positions?.length) return;
       for (const p of live.positions) {
         confirmPeak(p.position, p.pnl_pct, confirmTicks);
+        const tracked = getTrackedPosition(p.position);
         const exit = updatePnlAndCheckExits(p.position, p, config.management);
         const closeRule = exit ? null : getDeterministicCloseRule(p, config.management);
-        let signal = null, reason = null;
-        if (exit) { signal = exit.action ?? "EXIT"; reason = exit.reason; }
-        else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; }
+        const decision = manualExitDecision(tracked, { exit, closeRule });
+        const signal = decision ? (decision.action === "rebalance" ? "REBALANCE" : (exit?.action ?? `RULE_${closeRule?.rule ?? "MANUAL"}`)) : null;
+        const reason = decision?.reason ?? null;
         const { fire } = registerExitSignal(p.position, signal, confirmTicks);
         if (!signal || !fire) continue;
-        log("poll", `Exit confirmed (${confirmTicks} ticks): ${p.pair ?? p.position.slice(0, 8)} — ${reason} — closing`);
+        log("poll", `Exit confirmed (${confirmTicks} ticks): ${p.pair ?? p.position.slice(0, 8)} — ${reason} — ${decision.action === "rebalance" ? "rebalancing" : "closing"}`);
         manageBusy = true; // hold the slow cycle off this position
         try {
-          const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
-          const ok = res?.success !== false && !res?.error && !res?.blocked;
+          const { ok, res } = await closeForDecision(p, decision);
           log("poll", `${p.pair ?? p.position.slice(0, 8)}: ${ok ? "closed" : `close FAILED — ${res?.error || res?.reason || "unknown"}`}`);
         } finally {
           manageBusy = false;
@@ -350,7 +394,7 @@ function startHeartbeat() {
       lastRpcAlertAt = Date.now();
       void notify(`⚠️ RPC failing — every screened token errored (${scanStats.rpcError}). No entries until it recovers: check the RPC_URL quota or set FALLBACK_RPC_URL.`);
     }
-    log("heartbeat", `mode=${modeLabel()} | scanner scans=${scanStats.scans} last=${last} listed=${scanStats.listed} screened=${scanStats.candidates} emitted=${scanStats.emitted} errors=${scanStats.errors} | signals active=${active} queued=${signalQueue.length}`);
+    log("heartbeat", `mode=${modeLabel()} | scanner scans=${scanStats.scans} last=${last} listed=${scanStats.listed} screened=${scanStats.candidates} emitted=${scanStats.emitted} errors=${scanStats.errors} | manual=${config.manual.pools.length} | signals active=${active} queued=${signalQueue.length}`);
     store.prune();
     store.save();
   }, 60_000);
@@ -399,11 +443,16 @@ export async function startStandalone() {
   }
 
   const tiers = config.screening.enabledTiers.join("+");
+  const manualText = config.manual.pools.length ? ` | manual=${config.manual.pools.length} every ${config.manual.checkMin}m` : "";
   const modeText = { shadow: "SHADOW MODE (proposals recorded, nothing submitted)", "dry-run": "DRY RUN (nothing submitted)", live: "LIVE MODE" }[modeLabel()];
-  log("runtime", `Standalone starting — ${modeText} | tiers=${tiers} | scanner every ${config.scanner.scanMin}m${config.scanner.enabled ? "" : " (disabled — exits only)"} | screening deadline=${config.standalone.screeningDeadlineSec}s`);
+  log("runtime", `Standalone starting — ${modeText} | tiers=${tiers} | scanner every ${config.scanner.scanMin}m${config.scanner.enabled ? "" : " (disabled — exits only)"}${manualText} | screening deadline=${config.standalone.screeningDeadlineSec}s`);
 
-  // Entries come only from scanner signals; exits run on their own cadences.
+  // Scanner entries and manual-pool entries stay off the exit poller.
   if (config.scanner.enabled) stopScanner = startScanner({ store, onSignal, options: config.standalone });
+  if (config.manual.pools.length) {
+    timers.manual = setInterval(() => { void runManualTick(); }, Math.max(1, config.manual.checkMin) * 60_000);
+    void runManualTick();
+  }
   timers.manage = setInterval(() => { void manageOnce(); }, Math.max(1, config.schedule.managementIntervalMin) * 60_000);
   startPnlPoller();
   startHeartbeat();

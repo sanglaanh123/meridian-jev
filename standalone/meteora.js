@@ -8,8 +8,9 @@ import { closedOnly, indicatorSnapshot } from './indicators.js';
 const BASE = 'https://dlmm.datapi.meteora.ag';
 
 /** Paginated pool list. `filter` is an array of `<field><op><value>` clauses joined with &&. */
-export async function listPools({ filter = [], sort = 'fee_tvl_ratio_24h:desc', pageSize = 200 } = {}) {
+export async function listPools({ filter = [], sort = 'fee_tvl_ratio_24h:desc', pageSize = 200, page = null } = {}) {
   const params = new URLSearchParams({ page_size: String(pageSize), sort_by: sort });
+  if (page != null) params.set('page', String(page));
   if (filter.length) params.set('filter_by', filter.join(' && '));
   const result = await fetchJson(`${BASE}/pools?${params}`);
   if (!Array.isArray(result?.data)) throw new Error('Invalid Meteora pool list response');

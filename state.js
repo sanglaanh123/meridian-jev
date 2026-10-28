@@ -66,6 +66,8 @@ export function trackPosition({
   tier = null,
   label = null,
   stop_loss_pct,
+  take_profit_pct,
+  source = null,
   oor_wait_minutes = null,
 }) {
   const pos = {
@@ -91,6 +93,8 @@ export function trackPosition({
     label,
     // Per-position exit overrides (tuned regime entries); undefined/null = tier/global value.
     ...(stop_loss_pct !== undefined ? { stop_loss_pct } : {}),
+    ...(take_profit_pct !== undefined ? { take_profit_pct } : {}),
+    ...(source ? { source } : {}),
     oor_wait_minutes,
     signal_snapshot: signal_snapshot || null,
     deployed_at: new Date().toISOString(),

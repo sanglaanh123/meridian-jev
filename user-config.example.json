@@ -2,7 +2,7 @@
   "_readme": [
     "Bluechip + mid-cap Meteora DLMM farmer (token-X / SOL pools). Copy to user-config.json and edit; restart after changes.",
     "Omitted keys fall back to the defaults in config.js. Secrets (keys, private key) belong in .env, never here.",
-    "Entries come only from the Meteora pool scanner; data APIs are Jupiter and Meteora only.",
+    "Scanner entries come from the Meteora pool scanner. manualPools additionally names pools the daemon keeps open (address, or a token/SOL name that matches one pool). Data APIs are Jupiter and Meteora only.",
     "Tiers: the token's Jupiter market cap picks bluechip (>= bluechipMinMcap) or midcap; below midcapMinMcap is rejected. Tier fields are flat keys <tier><Field>, e.g. midcapMinTvl.",
     "shadowMode: true forces DRY_RUN. dryRunSolBalance: simulated SOL for sizing while DRY_RUN is on (null = real balance).",
     "strategy: auto | spot | curve | bid_ask. Under auto, a coin label (coin-labels.json) picks labelStrategies / labelPoolRules / labelIndicators; unlabeled coins use the unlabeled* keys.",
@@ -25,6 +25,12 @@
   "screeningRetrySec": 15,
   "maxEntryPriceMovePct": 3,
   "signalCooldownSec": 3600,
+  "manualPools": [],
+  "manualCheckMin": 5,
+  "manualTakeProfitPct": null,
+  "manualStopLossPct": -15,
+  "manualReentryMinutes": 60,
+  "manualStopCooldownMinutes": 360,
   "enabledTiers": [
     "bluechip",
     "midcap"

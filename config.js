@@ -98,9 +98,29 @@ const tiers = Object.fromEntries(Object.entries(TIER_DEFAULTS).map(([tier, defau
   Object.fromEntries(Object.entries(defaults).map(([field, value]) => [field, u[tierKey(tier, field)] ?? value])),
 ]));
 
+function normalizeManualPools(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(item => {
+    if (typeof item === "string") return { pool: item.trim() };
+    if (item && typeof item === "object") {
+      const entry = { pool: String(item.pool ?? "").trim() };
+      if ("takeProfitPct" in item) entry.takeProfitPct = item.takeProfitPct;
+      if ("stopLossPct" in item) entry.stopLossPct = item.stopLossPct;
+      if ("shape" in item) entry.shape = item.shape;
+      if ("rangeVolMult" in item) entry.rangeVolMult = item.rangeVolMult;
+      if ("outOfRangeWaitMinutes" in item) entry.outOfRangeWaitMinutes = item.outOfRangeWaitMinutes;
+      return entry;
+    }
+    return { pool: "" };
+  });
+}
+
+const manualPoolsInvalid = u.manualPools != null && !Array.isArray(u.manualPools);
+
 export const config = {
-  // Bluechip + mid-cap DLMM farmer. Entries come only from the Meteora pool
-  // scanner; there is no mode toggle. Shadow mode never submits transactions.
+  // Bluechip + mid-cap DLMM farmer. Scanner entries are tier-screened. An optional
+  // manualPools list keeps named pools open with the auto shape. Shadow mode never
+  // submits transactions.
   standalone: {
     shadow: u.shadowMode !== false,
     rpcUrl: nonEmptyString(process.env.RPC_URL, u.rpcUrl),
@@ -116,12 +136,23 @@ export const config = {
     dryRunSolBalance: u.dryRunSolBalance == null || numericConfig(u.dryRunSolBalance) < 0 ? null : numericConfig(u.dryRunSolBalance),
   },
 
-  // ─── Meteora pool scanner (the only entry trigger) ───
+  // ─── Meteora pool scanner (discovery entry trigger) ───
   scanner: {
     enabled:              u.scannerEnabled              ?? true,
     scanMin:              u.scanMin                     ?? 15,
     maxCandidatesPerScan: u.scanMaxCandidates           ?? 5,
     maxSignalsPerScan:    u.scanMaxSignals              ?? 1,
+  },
+
+  // ─── Manual pools (hold a named pool: auto shape, TP/SL, slow rebalance) ───
+  manual: {
+    pools: normalizeManualPools(u.manualPools),
+    poolsInvalid: manualPoolsInvalid,
+    checkMin: numericConfig(u.manualCheckMin) ?? 5,
+    takeProfitPct: u.manualTakeProfitPct !== undefined ? u.manualTakeProfitPct : null,
+    stopLossPct: u.manualStopLossPct ?? u.stopLossPct ?? u.emergencyPriceDropPct ?? -15,
+    reentryMinutes: numericConfig(u.manualReentryMinutes) ?? 60,
+    stopCooldownMinutes: numericConfig(u.manualStopCooldownMinutes) ?? 360,
   },
 
   // ─── Risk Limits ─────────────────────────
@@ -300,6 +331,25 @@ export function validateConfig() {
   for (const tier of config.screening.enabledTiers ?? []) {
     if (!config.screening.tiers[tier]) problems.push(`unknown tier "${tier}" in enabledTiers — use ${Object.keys(config.screening.tiers).join(", ")}`);
   }
+  if (config.manual.poolsInvalid) problems.push("manualPools must be an array");
+  if (!(config.manual.checkMin >= 1)) problems.push("manualCheckMin must be ≥ 1");
+  if (config.manual.takeProfitPct != null && !(config.manual.takeProfitPct > 0)) problems.push("manualTakeProfitPct must be positive or null");
+  if (!(config.manual.stopLossPct < 0)) problems.push("manualStopLossPct must be negative");
+  if (!(config.manual.reentryMinutes >= 0)) problems.push("manualReentryMinutes must be ≥ 0");
+  if (!(config.manual.stopCooldownMinutes >= 0)) problems.push("manualStopCooldownMinutes must be ≥ 0");
+  const seenPools = new Set();
+  config.manual.pools.forEach((entry, i) => {
+    const pool = entry.pool;
+    if (!pool) { problems.push(`manualPools[${i}] pool is empty`); return; }
+    const key = pool.toLowerCase();
+    if (seenPools.has(key)) problems.push(`manualPools duplicates "${pool}"`);
+    seenPools.add(key);
+    if ("takeProfitPct" in entry && entry.takeProfitPct != null && !(entry.takeProfitPct > 0)) problems.push(`manualPools[${i}].takeProfitPct must be positive or omitted`);
+    if ("stopLossPct" in entry && !(entry.stopLossPct < 0)) problems.push(`manualPools[${i}].stopLossPct must be negative`);
+    if ("shape" in entry && !SHAPES.includes(entry.shape)) problems.push(`manualPools[${i}].shape "${entry.shape}" — use ${SHAPES.join(", ")}`);
+    if ("rangeVolMult" in entry && !(entry.rangeVolMult > 0)) problems.push(`manualPools[${i}].rangeVolMult must be > 0`);
+    if ("outOfRangeWaitMinutes" in entry && !(entry.outOfRangeWaitMinutes >= 0)) problems.push(`manualPools[${i}].outOfRangeWaitMinutes must be ≥ 0`);
+  });
   return problems;
 }
 

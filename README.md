@@ -228,7 +228,7 @@ node cli.js db query "SELECT ..."     # read-only SQL against meridian.db
 
 The Telegram admin console has the same summary under 📊 Stats (or `/stats`).
 
-There is no manual deploy command; only the scanner opens positions. `--dry-run` simulates every transaction.
+There is no manual deploy command. `manualPools` in `user-config.json` names pools the daemon keeps open with the auto shape, a take profit, a stop, and a slow rebalance. The scanner still opens its own positions. `--dry-run` simulates every transaction.
 
 **Telegram admin** (`/menu`, `/status`): scanner, tier, sizing, exit and RPC settings, shadow toggle, key import/export, restart.
 
