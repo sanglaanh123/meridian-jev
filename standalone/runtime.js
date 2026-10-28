@@ -27,6 +27,7 @@ import { startAdmin } from "./telegram-admin.js";
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 let store = null;
+let lastRpcAlertAt = 0;
 let stopScanner = null;
 let lockPath = null;
 let stopAdmin = null;
@@ -345,6 +346,10 @@ function startHeartbeat() {
   timers.heartbeat = setInterval(() => {
     const active = Object.values(store.data.signals).filter(s => !s.done).length;
     const last = scanStats.lastScanAt ? `${Math.round((Date.now() - scanStats.lastScanAt) / 60_000)}m ago` : "never";
+    if (scanStats.rpcError && Date.now() - lastRpcAlertAt > 3600_000) {
+      lastRpcAlertAt = Date.now();
+      void notify(`⚠️ RPC failing — every screened token errored (${scanStats.rpcError}). No entries until it recovers: check the RPC_URL quota or set FALLBACK_RPC_URL.`);
+    }
     log("heartbeat", `mode=${modeLabel()} | scanner scans=${scanStats.scans} last=${last} listed=${scanStats.listed} screened=${scanStats.candidates} emitted=${scanStats.emitted} errors=${scanStats.errors} | signals active=${active} queued=${signalQueue.length}`);
     store.prune();
     store.save();

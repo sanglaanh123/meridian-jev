@@ -576,6 +576,21 @@ console.log("\n[13] strategy lab — shapes, regimes, policy");
   check("evaluation counts skips as zero", score.traded === 20 && Math.abs(score.mean - 1) < 1e-9);
 }
 
+{
+  const { buildMixed, valueAt, simulateRebalancer } = await import("../scripts/backtest-sim.js");
+  const mix = buildMixed({ price: 1, binStep: 10, solFrac: 0.5, bins: 14 });
+  check("mixed ladder is worth 1 at entry, half token", Math.abs(valueAt(mix, 1).value - 1) < 1e-9 && Math.abs(mix.tokenWeight - 0.5) < 1e-9);
+  const tokenOnly = buildMixed({ price: 1, binStep: 10, solFrac: 0, bins: 12 });
+  check("token-only ladder sits above the price", tokenOnly.bins.every(b => b.token && b.price > 1));
+  const costs = { swapFeePct: 0.6, txCostPct: 0 };
+  const flat = Array.from({ length: 200 }, (_, i) => ({ close: 1 + (i % 2) * 0.001, low: 0.999, high: 1.002 }));
+  const calm = simulateRebalancer({ candles: flat, lpFees: Array(200).fill(10), tvl: 100_000, binStep: 10, i0: 0, horizonHours: 150, costs, rebalanceCostPct: 0 });
+  check("calm market: no rebalances, fees accrue", calm.rebalances === 0 && calm.feesPct > 0);
+  const slide = Array.from({ length: 200 }, (_, i) => { const p = 1 * 0.999 ** i; return { close: p, low: p * 0.999, high: p * 1.001 }; });
+  const down = simulateRebalancer({ candles: slide, lpFees: Array(200).fill(0), tvl: 100_000, binStep: 10, i0: 0, horizonHours: 150, costs, rebalanceCostPct: 0, stopDropPct: null });
+  check("steady slide: swapless rebalances lock in the move and trail holding the mix", down.rebalances > 5 && down.vsHoldMixPct < 0, JSON.stringify(down));
+}
+
 console.log("\n[14] indicators — ER, structure, ZLEMA, ATR, ADX, resample");
 {
   const ind = await import("../standalone/indicators.js");
@@ -625,6 +640,13 @@ console.log("\n[14] indicators — ER, structure, ZLEMA, ATR, ADX, resample");
   const chop1h = Array.from({ length: 60 }, (_, i) => bar(100 + (i % 2 ? 1 : -1), i)), chop4h = Array.from({ length: 30 }, (_, i) => bar(100 + (i % 2 ? 1 : -1), i, 4));
   const calm = ind.indicatorSnapshot(chop1h, chop4h);
   check("chop snapshot opens the ER-chop gate and the ADX gate", ind.INDICATOR_GATES.er4_chop(calm) && ind.INDICATOR_GATES.adx1_low(calm), JSON.stringify({ r: calm.regime4, adx: calm.adx1 }));
+}
+
+{
+  const { rpcErrorSummary } = await import("../standalone/rpc.js");
+  check("RPC error summary keeps the provider reason", rpcErrorSummary(new Error("429 : max usage reached")) === "429 : max usage reached");
+  const leaky = rpcErrorSummary(new Error("failed to fetch https://mainnet.helius-rpc.com/?api-key=SECRET123 (api_key=SECRET123)"));
+  check("RPC error summary never leaks URLs or keys", !leaky.includes("SECRET123") && !leaky.includes("helius"), leaky);
 }
 
 console.log("\n[15] Secret key formats");

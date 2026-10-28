@@ -15,9 +15,10 @@ import { parseArgs } from "node:util";
 import { config } from "../config.js";
 import { classifyRegime, pickShape } from "../standalone/regime.js";
 import { realizedVolatility } from "../standalone/meteora.js";
-import { erMetrics, classifyEr, atrSeries, zigzagSwingPct, structureSeries, atrZlemaTrend, adxSeries, resample, INDICATOR_GATES, INDICATOR_EXITS } from "../standalone/indicators.js";
+import { INDICATOR_GATES, INDICATOR_EXITS } from "../standalone/indicators.js";
 import { simulateEpisode } from "./backtest-sim.js";
 import { loadHistory, cacheDir, hourNowSec } from "./history.js";
+import { hourlyIndicatorFeatures as features } from "./lab-data.js";
 import { getPool } from "../standalone/meteora.js";
 
 const { values: flags } = parseArgs({
@@ -36,25 +37,6 @@ const SIM_SHAPE = { spot: "spot", curve: "curve", bid_ask: "bidask" };
 const GROUP = { wrapped: "calm", defi_bluechip: "calm", calm: "calm", volatile: "volatile", meme: "volatile" };
 const fmt = (n, d = 2) => (n >= 0 ? " " : "") + n.toFixed(d);
 const mean = xs => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
-
-/** Hourly feature arrays; 4h features come from 4h bars closed at or before each hour. */
-function features(candles) {
-  const { bars, closeIndex } = resample(candles, 4);
-  const st4 = structureSeries(bars, 3), zl4 = atrZlemaTrend(bars), zl1 = atrZlemaTrend(candles), adx1 = adxSeries(candles), atr1 = atrSeries(candles, 14);
-  const f = [];
-  let k = -1;
-  for (let i = 0; i < candles.length; i++) {
-    while (k + 1 < closeIndex.length && closeIndex[k + 1] <= i) k++;
-    const er4 = k >= 5 ? erMetrics(bars, k, 6) : null;
-    f.push({
-      er1: erMetrics(candles, i, 24), er4, regime4: classifyEr(er4),
-      struct4: k >= 0 ? st4[k].trend : 0, zl4: k >= 0 ? zl4[k] : null, zl1: zl1[i], adx1: adx1[i],
-      atrPct1: atr1[i] == null ? null : atr1[i] / candles[i].close * 100,
-      swingPct: zigzagSwingPct(candles, i, 72, 1),
-    });
-  }
-  return f;
-}
 
 // Same gate/exit definitions the bot uses.
 const GATES = INDICATOR_GATES;

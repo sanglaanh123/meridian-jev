@@ -197,3 +197,59 @@ export function simulatePool({ candles, lpFees, tvl, binStep, tier, screening, p
     stops: trades.filter(t => t.reason === "stop loss").length,
   };
 }
+
+// ─── Rebalancing (HawkFi "HFL"-style) ───────────────────────────────────────
+
+/**
+ * Ladder worth 1 at `price` holding `solFrac` as SOL in bins at/below price and
+ * the rest as token in bins above it (flat weights per side). solFrac 1 = SOL only,
+ * 0 = token only. Same bin model as buildPosition, so valueAt/feeShare apply.
+ */
+export function buildMixed({ price, binStep, solFrac, bins }) {
+  const r = 1 + binStep / 10_000;
+  const below = solFrac >= 1 ? bins : solFrac <= 0 ? 0 : Math.min(bins - 1, Math.max(1, Math.round(bins * solFrac)));
+  const above = bins - below;
+  const out = [];
+  for (let k = -(below - 1); k <= 0 && below > 0; k++) out.push({ k, price: price * r ** k, w: solFrac / below, token: false });
+  for (let k = 1; k <= above; k++) out.push({ k, price: price * r ** k, w: (1 - solFrac) / above, token: true });
+  return { entryPrice: price, r, bins: out, n: out.length, hi: out.at(-1).price, lo: out[0].price, tokenWeight: 1 - solFrac };
+}
+
+/**
+ * Auto-rebalancing position: when the hourly close leaves the range (and the
+ * cooldown has passed), re-centre on the close. "swapless" re-places whatever
+ * mix is held (locks the move in, as HawkFi's HFL); "swap" first swaps the token
+ * side back to SOL and re-enters SOL-only below the price.
+ * start: "two" (50/50 around price, half swapped at entry) or "sol" (SOL below).
+ * Returns pnl vs holding SOL, plus vs holding the starting mix.
+ */
+export function simulateRebalancer({ candles, lpFees, tvl, binStep, i0, horizonHours = 168, bins = 14, rebalanceBins = 12, cooldownHours = 0, mode = "swapless", start = "two", stopDropPct = 20, feeCutPct = 0, rebalanceCostPct = 0.02, costs, concentration = 1 }) {
+  const p0 = candles[i0].close;
+  let scale = 1 - (start === "two" ? 0.5 * costs.swapFeePct / 100 : 0);
+  let pos = buildMixed({ price: p0, binStep, solFrac: start === "two" ? 0.5 : 1, bins });
+  let fees = 0, rebalances = 0, last = i0, reason = "horizon";
+  const end = Math.min(candles.length - 1, i0 + horizonHours);
+  let i = i0 + 1;
+  for (; i <= end; i++) {
+    const c = candles[i];
+    const { value } = valueAt(pos, c.close);
+    fees += scale * value * (lpFees[i] / tvl) * concentration * feeShare(pos, c.low, c.high) * (1 - feeCutPct / 100);
+    if (stopDropPct != null && c.close <= p0 * (1 - stopDropPct / 100)) { reason = "stop"; break; }
+    if ((c.close > pos.hi || c.close < pos.lo) && i - last >= cooldownHours) {
+      const h = valueAt(pos, c.close);
+      let total = scale * h.value, tokenValue = scale * h.tokenValue;
+      if (mode === "swap") { total -= tokenValue * costs.swapFeePct / 100; tokenValue = 0; }
+      total *= 1 - rebalanceCostPct / 100;
+      pos = buildMixed({ price: c.close, binStep, solFrac: mode === "swap" ? 1 : 1 - tokenValue / (scale * h.value), bins: rebalanceBins });
+      scale = total;
+      rebalances++;
+      last = i;
+    }
+  }
+  const exitAt = Math.min(i, end);
+  const pEnd = candles[exitAt].close;
+  const h = valueAt(pos, pEnd);
+  const final = scale * h.value - scale * h.tokenValue * costs.swapFeePct / 100 + fees - costs.txCostPct / 100;
+  const holdMix = start === "two" ? 0.5 + 0.5 * (pEnd / p0) - 0.5 * costs.swapFeePct / 100 : 1;
+  return { pnlPct: (final - 1) * 100, vsHoldMixPct: (final - holdMix) * 100, feesPct: fees * 100, rebalances, hours: exitAt - i0, reason };
+}

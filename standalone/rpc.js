@@ -26,6 +26,18 @@ export async function readRpc(kind, fn) {
       return await fn(connections.get(url));
     } catch (e) { error = e; }
   }
-  // Provider errors may contain authenticated URLs. Keep them out of persisted state.
-  throw new Error(`RPC ${kind} read failed (${error?.name || 'Error'})`);
+  throw new Error(`RPC ${kind} read failed (${rpcErrorSummary(error)})`);
+}
+
+/**
+ * Short, log-safe reason for an RPC failure (e.g. "429 max usage reached").
+ * Provider errors may contain authenticated URLs or api keys: strip them.
+ */
+export function rpcErrorSummary(error) {
+  const text = String(error?.message ?? error?.name ?? 'Error')
+    .replace(/https?:\/\/\S+/gi, '<url>')
+    .replace(/(api[-_]?key|token|secret)=[^&\s"]+/gi, '$1=<redacted>')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return text.slice(0, 80) || 'Error';
 }

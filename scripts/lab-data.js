@@ -9,6 +9,7 @@ import { fetchJson } from "../standalone/rpc.js";
 import { tierFor } from "../standalone/screening.js";
 import { jevAsk } from "../standalone/judgment.js";
 import { cacheDir } from "./history.js";
+import { erMetrics, classifyEr, atrSeries, zigzagSwingPct, structureSeries, atrZlemaTrend, adxSeries, resample } from "../standalone/indicators.js";
 
 /** Verified tier tokens with a liquid SOL pool (largest TVL pool per mint). */
 export async function buildUniverse({ maxPools = 30 } = {}) {
@@ -57,3 +58,23 @@ export async function jevFeatures(universe, questions) {
   fs.writeFileSync(file, JSON.stringify(cache, null, 2));
   return cache;
 }
+
+/** Hourly feature arrays; 4h features come from 4h bars closed at or before each hour. */
+export function hourlyIndicatorFeatures(candles) {
+  const { bars, closeIndex } = resample(candles, 4);
+  const st4 = structureSeries(bars, 3), zl4 = atrZlemaTrend(bars), zl1 = atrZlemaTrend(candles), adx1 = adxSeries(candles), atr1 = atrSeries(candles, 14);
+  const f = [];
+  let k = -1;
+  for (let i = 0; i < candles.length; i++) {
+    while (k + 1 < closeIndex.length && closeIndex[k + 1] <= i) k++;
+    const er4 = k >= 5 ? erMetrics(bars, k, 6) : null;
+    f.push({
+      er1: erMetrics(candles, i, 24), er4, regime4: classifyEr(er4),
+      struct4: k >= 0 ? st4[k].trend : 0, zl4: k >= 0 ? zl4[k] : null, zl1: zl1[i], adx1: adx1[i],
+      atrPct1: atr1[i] == null ? null : atr1[i] / candles[i].close * 100,
+      swingPct: zigzagSwingPct(candles, i, 72, 1),
+    });
+  }
+  return f;
+}
+

@@ -245,6 +245,7 @@ All scripts below only read Meteora history. Data is cached in `.backtest-cache/
 | `scripts/tune.js` | Tunes regime thresholds and per-regime parameters; tests Jev questions and the `minEstablished` gate (`--symbols` tunes one coin group) |
 | `scripts/binstep-lab.js` | Compares pool / bin-step rules per label |
 | `scripts/indicator-lab.js` | Compares indicator entry gates, exits, range widths and shape skew per label group |
+| `scripts/rebalance-lab.js` | Auto-rebalancing (HawkFi HFL-style, swapless or swap, cooldowns, widths) vs the bot's close-and-re-enter |
 | `scripts/label-coins.js` | Lists coins and suggests labels |
 
 **Headline results** (60 days, after 0.6% swap and transaction costs; % per 72h position, test period):
@@ -261,6 +262,7 @@ All scripts below only read Meteora history. Data is cached in `.backtest-cache/
 - Almost all of the improvement comes from **not entering trending markets**.
 - **The real fee share of a position is still unknown.** The model assumes the pool-average fee/TVL; only a live position can measure it.
 - The 0.5% Jupiter referral fee is the largest single cost. Disable it.
+- **Auto-rebalancing loses more.** Rebalancing the moment price leaves the range turns impermanent loss into a realized loss on every exit. HawkFi-style HFL Regular (14 bins, swapless, 0 cooldown) simulated at −14%/week on calm coins and −36%/week on volatile coins versus holding SOL. Even the widest, slowest variant (69 bins, 24h cooldown) trailed the current close-and-wait strategy, so the bot does not rebalance.
 
 ---
 
